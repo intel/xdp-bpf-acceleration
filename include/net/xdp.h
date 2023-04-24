@@ -72,6 +72,7 @@ enum xdp_buff_flags {
 	XDP_FLAGS_FRAGS_PF_MEMALLOC	= BIT(1), /* xdp paged memory is under
 						   * pressure
 						   */
+	XDP_FLAGS_XSK_WITH_ACCEL	= BIT(2), /* xsk buff used by accel */
 };
 
 struct xdp_buff {
@@ -109,6 +110,17 @@ static __always_inline void xdp_buff_set_frag_pfmemalloc(struct xdp_buff *xdp)
 {
 	xdp->flags |= XDP_FLAGS_FRAGS_PF_MEMALLOC;
 }
+
+static __always_inline bool xdp_buff_is_xsk_with_accel(struct xdp_buff *xdp)
+{
+	return !!(xdp->flags & XDP_FLAGS_XSK_WITH_ACCEL);
+}
+
+static __always_inline void xdp_buff_set_xsk_with_accel(struct xdp_buff *xdp)
+{
+	xdp->flags |= XDP_FLAGS_XSK_WITH_ACCEL;
+}
+
 
 static __always_inline void
 xdp_init_buff(struct xdp_buff *xdp, u32 frame_sz, struct xdp_rxq_info *rxq)
@@ -291,7 +303,8 @@ struct xdp_frame *xdp_convert_buff_to_frame(struct xdp_buff *xdp)
 {
 	struct xdp_frame *xdp_frame;
 
-	if (xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL)
+	if ((xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL) &&
+	    !xdp_buff_is_xsk_with_accel(xdp))
 		return xdp_convert_zc_to_xdp_frame(xdp);
 
 	/* Store info in top of packet */

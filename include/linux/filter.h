@@ -572,6 +572,7 @@ extern int (*nfct_btf_struct_access)(struct bpf_verifier_log *log,
 				     const struct bpf_reg_state *reg,
 				     int off, int size, enum bpf_access_type atype,
 				     u32 *next_btf_id, enum bpf_type_flag *flag);
+bool is_acceldev(struct bpf_map *map);
 
 typedef unsigned int (*bpf_dispatcher_fn)(const void *ctx,
 					  const struct bpf_insn *insnsi,
@@ -1509,12 +1510,18 @@ static __always_inline int __bpf_xdp_redirect_map(struct bpf_map *map, u64 index
 {
 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
 	const u64 action_mask = XDP_ABORTED | XDP_DROP | XDP_PASS | XDP_TX;
+	u32 key_index;
 
 	/* Lower bits of the flags are used as return code on lookup failure */
 	if (unlikely(flags & ~(action_mask | flag_mask)))
 		return XDP_ABORTED;
 
-	ri->tgt_value = lookup_elem(map, index);
+	if (is_acceldev(map)) {
+		key_index = (u32)(index >> 32);
+		ri->tgt_value = lookup_elem(map, key_index);
+	} else {
+		ri->tgt_value = lookup_elem(map, index);
+	}
 	if (unlikely(!ri->tgt_value) && !(flags & BPF_F_BROADCAST)) {
 		/* If the lookup fails we want to clear out the state in the
 		 * redirect_info struct completely, so that if an eBPF program
@@ -1530,7 +1537,8 @@ static __always_inline int __bpf_xdp_redirect_map(struct bpf_map *map, u64 index
 	ri->map_id = map->id;
 	ri->map_type = map->map_type;
 
-	if (flags & BPF_F_BROADCAST) {
+	if ((flags & BPF_F_BROADCAST) ||
+	    is_acceldev(map)) {
 		WRITE_ONCE(ri->map, map);
 		ri->flags = flags;
 	} else {

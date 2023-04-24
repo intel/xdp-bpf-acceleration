@@ -5,6 +5,7 @@
 #include <crypto/authenc.h>
 #include <linux/err.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <net/ip.h>
 #include <net/xfrm.h>
 #include <net/esp.h>
@@ -23,6 +24,12 @@
 
 #include <linux/highmem.h>
 
+#define BYPASS_NONE 0
+#define BYPASS_DECRYPTION 1
+#define BYPASS_ENCRYPTION 2
+#define BYPASS_BOTH_DECRYPTION_AND_ENCRYPTION 3
+
+static int esp4_bypass_crypto = BYPASS_NONE;
 struct esp_skb_cb {
 	struct xfrm_skb_cb xfrm;
 	void *tmp;
@@ -889,79 +896,86 @@ static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
 	struct scatterlist *sg;
 	int err = -EINVAL;
 
-	if (!pskb_may_pull(skb, sizeof(struct ip_esp_hdr) + ivlen))
-		goto out;
+	if (esp4_bypass_crypto == BYPASS_DECRYPTION) {
+		/* esp_input_tail */
+		if (!pskb_may_pull(skb, sizeof(struct ip_esp_hdr) +
+					crypto_aead_ivsize((struct crypto_aead *)x->data)))
+			return -EINVAL;
+		return esp_input_done2(skb, 0);
+	} else if (esp4_bypass_crypto == BYPASS_NONE) {
+		if (!pskb_may_pull(skb, sizeof(struct ip_esp_hdr) + ivlen))
+			goto out;
 
-	if (elen <= 0)
-		goto out;
+		if (elen <= 0)
+			goto out;
 
-	assoclen = sizeof(struct ip_esp_hdr);
-	seqhilen = 0;
+		assoclen = sizeof(struct ip_esp_hdr);
+		seqhilen = 0;
 
-	if (x->props.flags & XFRM_STATE_ESN) {
-		seqhilen += sizeof(__be32);
-		assoclen += seqhilen;
-	}
-
-	if (!skb_cloned(skb)) {
-		if (!skb_is_nonlinear(skb)) {
-			nfrags = 1;
-
-			goto skip_cow;
-		} else if (!skb_has_frag_list(skb)) {
-			nfrags = skb_shinfo(skb)->nr_frags;
-			nfrags++;
-
-			goto skip_cow;
+		if (x->props.flags & XFRM_STATE_ESN) {
+			seqhilen += sizeof(__be32);
+			assoclen += seqhilen;
 		}
-	}
 
-	err = skb_cow_data(skb, 0, &trailer);
-	if (err < 0)
-		goto out;
+		if (!skb_cloned(skb)) {
+			if (!skb_is_nonlinear(skb)) {
+				nfrags = 1;
 
-	nfrags = err;
+				goto skip_cow;
+			} else if (!skb_has_frag_list(skb)) {
+				nfrags = skb_shinfo(skb)->nr_frags;
+				nfrags++;
+
+				goto skip_cow;
+			}
+		}
+
+		err = skb_cow_data(skb, 0, &trailer);
+		if (err < 0)
+			goto out;
+
+		nfrags = err;
 
 skip_cow:
-	err = -ENOMEM;
-	tmp = esp_alloc_tmp(aead, nfrags, seqhilen);
-	if (!tmp)
-		goto out;
+		err = -ENOMEM;
+		tmp = esp_alloc_tmp(aead, nfrags, seqhilen);
+		if (!tmp)
+			goto out;
 
-	ESP_SKB_CB(skb)->tmp = tmp;
-	seqhi = esp_tmp_extra(tmp);
-	iv = esp_tmp_iv(aead, tmp, seqhilen);
-	req = esp_tmp_req(aead, iv);
-	sg = esp_req_sg(aead, req);
+		ESP_SKB_CB(skb)->tmp = tmp;
+		seqhi = esp_tmp_extra(tmp);
+		iv = esp_tmp_iv(aead, tmp, seqhilen);
+		req = esp_tmp_req(aead, iv);
+		sg = esp_req_sg(aead, req);
 
-	esp_input_set_header(skb, seqhi);
+		esp_input_set_header(skb, seqhi);
 
-	sg_init_table(sg, nfrags);
-	err = skb_to_sgvec(skb, sg, 0, skb->len);
-	if (unlikely(err < 0)) {
-		kfree(tmp);
-		goto out;
+		sg_init_table(sg, nfrags);
+		err = skb_to_sgvec(skb, sg, 0, skb->len);
+		if (unlikely(err < 0)) {
+			kfree(tmp);
+			goto out;
+		}
+
+		skb->ip_summed = CHECKSUM_NONE;
+
+		if ((x->props.flags & XFRM_STATE_ESN))
+			aead_request_set_callback(req, 0, esp_input_done_esn, skb);
+		else
+			aead_request_set_callback(req, 0, esp_input_done, skb);
+
+		aead_request_set_crypt(req, sg, sg, elen + ivlen, iv);
+		aead_request_set_ad(req, assoclen);
+
+		err = crypto_aead_decrypt(req);
+		if (err == -EINPROGRESS)
+			goto out;
+
+		if ((x->props.flags & XFRM_STATE_ESN))
+			esp_input_restore_header(skb);
+
+		err = esp_input_done2(skb, err);
 	}
-
-	skb->ip_summed = CHECKSUM_NONE;
-
-	if ((x->props.flags & XFRM_STATE_ESN))
-		aead_request_set_callback(req, 0, esp_input_done_esn, skb);
-	else
-		aead_request_set_callback(req, 0, esp_input_done, skb);
-
-	aead_request_set_crypt(req, sg, sg, elen + ivlen, iv);
-	aead_request_set_ad(req, assoclen);
-
-	err = crypto_aead_decrypt(req);
-	if (err == -EINPROGRESS)
-		goto out;
-
-	if ((x->props.flags & XFRM_STATE_ESN))
-		esp_input_restore_header(skb);
-
-	err = esp_input_done2(skb, err);
-
 out:
 	return err;
 }
@@ -1233,6 +1247,8 @@ static int __init esp4_init(void)
 		xfrm_unregister_type(&esp_type, AF_INET);
 		return -EAGAIN;
 	}
+
+	pr_info("%s: esp4_bypass_crypto : %d\n", __func__, esp4_bypass_crypto);
 	return 0;
 }
 
@@ -1246,4 +1262,6 @@ static void __exit esp4_fini(void)
 module_init(esp4_init);
 module_exit(esp4_fini);
 MODULE_LICENSE("GPL");
+module_param(esp4_bypass_crypto, int, 0644);
+MODULE_PARM_DESC(esp4_bypass_crypto, "Select to bypass crypto in esp4 module! 0: none, 1: bypass decryption, 2: bypass encryption, 3: bypass both encryption and decryption. Default: 0");
 MODULE_ALIAS_XFRM_TYPE(AF_INET, XFRM_PROTO_ESP);

@@ -2073,6 +2073,7 @@ struct btf *bpf_get_btf_vmlinux(void);
 struct xdp_frame;
 struct sk_buff;
 struct bpf_dtab_netdev;
+struct bpf_dtab_acceldev;
 struct bpf_cpu_map_entry;
 
 void __dev_flush(void);
@@ -2087,6 +2088,8 @@ int dev_map_generic_redirect(struct bpf_dtab_netdev *dst, struct sk_buff *skb,
 int dev_map_redirect_multi(struct net_device *dev, struct sk_buff *skb,
 			   struct bpf_prog *xdp_prog, struct bpf_map *map,
 			   bool exclude_ingress);
+int acceldev_map_enqueue(struct bpf_dtab_acceldev *dst, struct xdp_frame *xdpf,
+			 struct net_device *dev_rx);
 
 void __cpu_map_flush(void);
 int cpu_map_enqueue(struct bpf_cpu_map_entry *rcpu, struct xdp_frame *xdpf,

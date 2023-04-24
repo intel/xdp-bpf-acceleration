@@ -49,14 +49,58 @@
 #include <linux/filter.h>
 #include <trace/events/xdp.h>
 #include <linux/btf_ids.h>
+#include <linux/pci.h>
+#include <linux/mm.h>
+#include <linux/memblock.h>
+#include <linux/vmalloc.h>
+#include <linux/slab.h>
 
 #define DEV_CREATE_FLAG_MASK \
-	(BPF_F_NUMA_NODE | BPF_F_RDONLY | BPF_F_WRONLY)
+	(BPF_F_NUMA_NODE | BPF_F_RDONLY | BPF_F_WRONLY | BPF_F_ACCELDEVMAP_HASH)
+
+#define ACCELDEV_CTX_BUCKET 8
+#define ACCELDEV_CTX_HASHMAX (1 * 1024 * 1024)
+#define DEV_MAP_BULK_SIZE_ACCELDEV 16
+
+/* - if enable ACCELDEV_GET_NEXT_KEY_CTX_ENBALED, to acceldev case,
+ * map_get_next_key() will get next ctx key(from next acceldev if
+ * current acceldev doesn't have one).
+ * - if disable ACCELDEV_GET_NEXT_KEY_CTX_ENBALED, map_get_next_key() will
+ * get next acceldev.
+ */
+#define ACCELDEV_GET_NEXT_KEY_CTX_ENBALED 0
+
+/* if enable ACCELDEV_LOOKUP_ELEM_CTX_ENBALED, to acceldev case,
+ * dev_map_lookup_elem() will get acceldevmap_val from acceldev_ctx.
+ * if disable ACCELDEV_LOOKUP_ELEM_CTX_ENBALED, dev_map_lookup_elem() will
+ * get acceldev_handle from acceldev.
+ */
+#define ACCELDEV_LOOKUP_ELEM_CTX_ENBALED 0
+
+#define ACCELDEV_NUM_MAX (512)
+#define ACCELDEV_NUM_MIN (32)
+
+#define GET_KEY_INSTANCE(key) ((u32)(*(u64 *)(key) >> 32))
+#define GET_KEY_CTX(key) ((u32)(*(u64 *)(key) & 0x00000000ffffffff))
+
+#define HMASK_TO_BUCKET(n) ((n) + 1)
+#define BUCKET_TO_HMASK(n) ((n) - 1)
+
+#define DTAB_STYLE_IS_ACCELDEV(dtab) (is_acceldev(&((dtab)->map)))
 
 struct xdp_dev_bulk_queue {
 	struct xdp_frame *q[DEV_MAP_BULK_SIZE];
 	struct list_head flush_node;
 	struct net_device *dev;
+	struct net_device *dev_rx;
+	struct bpf_prog *xdp_prog;
+	unsigned int count;
+};
+
+struct xdp_acceldev_bulk_queue {
+	struct xdp_frame *q[DEV_MAP_BULK_SIZE_ACCELDEV];
+	struct list_head flush_node;
+	struct bpf_dtab_acceldev *acceldev;
 	struct net_device *dev_rx;
 	struct bpf_prog *xdp_prog;
 	unsigned int count;
@@ -72,21 +116,89 @@ struct bpf_dtab_netdev {
 	struct bpf_devmap_val val;
 };
 
+struct bpf_dtab_acceldev;
+
+/* context associated with the acceldevmap_val */
+struct bpf_acceldevmap_val_ctx {
+	struct hlist_node index_hlist;
+	void *ctx;
+	int idx;
+	struct rcu_head rcu;
+	struct bpf_acceldev_ops *acceldev_ops;
+	void *acceldev_handle;
+	struct bpf_acceldevmap_val acceldevmap_val;
+};
+
+/* store the acceldev_ops registered by acceldev driver */
+struct bpf_acceldev_ops_data {
+	struct list_head list;
+	struct rcu_head rcu;
+	struct bpf_acceldev_ops acceldev_ops;
+};
+
+/* accel dev instance structure */
+struct bpf_dtab_acceldev {
+	struct pci_dev *dev; /* must be first member, due to tracepoint */
+	enum bpf_acceldev_type acceldev_type;
+	struct hlist_node index_hlist;
+	struct bpf_dtab *dtab;
+	struct bpf_prog *xdp_prog;
+	struct rcu_head rcu;
+
+	/* acceldev instance, created only once when it's first selected by user
+	 * with acceldevmap_val, may be shared with other ctx/acceldevmap_val
+	 */
+	void *acceldev_handle;
+	int idx; /* map key */
+
+	/* from acceldev_ops_list with the same pci_dev */
+	struct bpf_acceldev_ops *acceldev_ops;
+
+	/* ctx list associated with the acceldev_handle */
+	struct hlist_head *ctx_idx_head;
+	/* refers to __xfrm_state_lookup() */
+	unsigned int		ctx_items;
+	unsigned int		ctx_n_buckets;
+	struct work_struct	ctx_hash_work;
+	seqcount_spinlock_t ctx_seqcount_lock;
+	spinlock_t			ctx_lock; /* Used for ctx operation in acceldev */
+
+	struct xdp_acceldev_bulk_queue __percpu *bq;
+};
+
 struct bpf_dtab {
 	struct bpf_map map;
 	struct bpf_dtab_netdev __rcu **netdev_map; /* DEVMAP type only */
 	struct list_head list;
 
 	/* these are only used for DEVMAP_HASH type maps */
+	enum bpf_dev_type dev_type;
 	struct hlist_head *dev_index_head;
-	spinlock_t index_lock;
+	spinlock_t index_lock; /* Used for acceldev operation in dtab */
 	unsigned int items;
 	u32 n_buckets;
 };
 
 static DEFINE_PER_CPU(struct list_head, dev_flush_list);
+static DEFINE_PER_CPU(struct list_head, acceldev_flush_list);
+
 static DEFINE_SPINLOCK(dev_map_lock);
 static LIST_HEAD(dev_map_list);
+static DEFINE_SPINLOCK(acceldev_ops_data_lock);
+static LIST_HEAD(acceldev_ops_data_list); /* bpf_acceldevmap_register() */
+static bool batch_enabled = true;
+
+bool is_acceldev(struct bpf_map *map)
+{
+	struct bpf_dtab *dtab;
+
+	if (likely(map) && map->map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
+		dtab = container_of(map, struct bpf_dtab, map);
+		if (dtab->dev_type == BPF_ACCEL_DEV)
+			return true;
+	}
+	return false;
+}
 
 static struct hlist_head *dev_map_create_hash(unsigned int entries,
 					      int numa_node)
@@ -94,8 +206,8 @@ static struct hlist_head *dev_map_create_hash(unsigned int entries,
 	int i;
 	struct hlist_head *hash;
 
-	hash = bpf_map_area_alloc((u64) entries * sizeof(*hash), numa_node);
-	if (hash != NULL)
+	hash = bpf_map_area_alloc((u64)entries * sizeof(*hash), numa_node);
+	if (!hash)
 		for (i = 0; i < entries; i++)
 			INIT_HLIST_HEAD(&hash[i]);
 
@@ -108,6 +220,215 @@ static inline struct hlist_head *dev_map_index_hash(struct bpf_dtab *dtab,
 	return &dtab->dev_index_head[idx & (dtab->n_buckets - 1)];
 }
 
+static inline unsigned int acceldev_ctx_map_index_hash_with_mask(int idx, unsigned int hashmask)
+{
+	unsigned int h = (__force u32)idx;
+
+	h = (h ^ (h >> 10) ^ (h >> 20)) & hashmask;
+	return h;
+}
+
+static inline struct hlist_head *acceldev_ctx_map_index_hash(struct bpf_dtab_acceldev *acceldev,
+							     int idx)
+{
+	int hmask = BUCKET_TO_HMASK(acceldev->ctx_n_buckets);
+	int sz = acceldev_ctx_map_index_hash_with_mask(idx, hmask);
+
+	return acceldev->ctx_idx_head + sz;
+}
+
+static void __acceldev_entry_free_no_destory(struct rcu_head *rcu)
+{
+	struct bpf_dtab_acceldev *acceldev;
+
+	acceldev = container_of(rcu, struct bpf_dtab_acceldev, rcu);
+	kfree(acceldev);
+}
+
+void bpf_acceldevmap_set_single_mode(bool status)
+{
+	if (status)
+		batch_enabled = false;
+	else
+		batch_enabled = true;
+}
+EXPORT_SYMBOL(bpf_acceldevmap_set_single_mode);
+
+/* exported to acceldev driver */
+int bpf_acceldevmap_register(struct bpf_acceldev_ops *acceldev_ops)
+{
+	/* Add acceldev_ops into acceldev_ops_list */
+	struct bpf_acceldev_ops_data *ops_new;
+	struct bpf_acceldev_ops_data *ops_old;
+	struct bpf_dtab *dtab;
+	int i;
+	unsigned long flags;
+	int cpu;
+
+	if (!acceldev_ops ||
+	    acceldev_ops->acceldev_type >= BPF_ACCELDEV_MAX ||
+		!acceldev_ops->create_instance ||
+		!acceldev_ops->destroy_instance ||
+		!acceldev_ops->create_ctx ||
+		!acceldev_ops->destroy_ctx ||
+		!acceldev_ops->enqueue) {
+		return -EINVAL;
+	}
+
+	/*
+	 * trace_printk("bpf_acceldevmap_register called. accledev_name:%s, acceldev_type:%d\n",
+	 *    acceldev_ops->acceldev_name, acceldev_ops->acceldev_type);
+	 */
+
+	/* Add acceldev_ops to acceldev_ops_data_list*/
+	spin_lock(&acceldev_ops_data_lock);
+	list_for_each_entry(ops_old, &acceldev_ops_data_list, list) {
+		if (acceldev_ops->acceldev_type == ops_old->acceldev_ops.acceldev_type &&
+		    acceldev_ops->dev == ops_old->acceldev_ops.dev) {
+			/* Reject duplicate register */
+			spin_unlock(&acceldev_ops_data_lock);
+			kfree(ops_new);
+			return -EINVAL;
+		}
+	}
+
+	ops_new = bpf_map_area_alloc(sizeof(*ops_new), NUMA_NO_NODE);
+	if (!ops_new)
+		return -ENOMEM;
+
+	memcpy(ops_new->acceldev_ops.acceldev_name, acceldev_ops->acceldev_name, MAX_ACCEL_NAME);
+	ops_new->acceldev_ops.acceldev_type = acceldev_ops->acceldev_type;
+	ops_new->acceldev_ops.dev = acceldev_ops->dev;
+	ops_new->acceldev_ops.create_instance = acceldev_ops->create_instance;
+	ops_new->acceldev_ops.destroy_instance = acceldev_ops->destroy_instance;
+	ops_new->acceldev_ops.create_ctx = acceldev_ops->create_ctx;
+	ops_new->acceldev_ops.destroy_ctx = acceldev_ops->destroy_ctx;
+	ops_new->acceldev_ops.enqueue = acceldev_ops->enqueue;
+
+	list_add_tail(&ops_new->list, &acceldev_ops_data_list);
+	spin_unlock(&acceldev_ops_data_lock);
+
+	/* Add acceldev_ops to acceldev hlist */
+	rcu_read_lock();
+	list_for_each_entry_rcu(dtab, &dev_map_list, list) {
+		if (DTAB_STYLE_IS_ACCELDEV(dtab) ||
+		    dtab->map.map_type != BPF_MAP_TYPE_DEVMAP_HASH) {
+			continue;
+		}
+
+		spin_lock_irqsave(&dtab->index_lock, flags);
+		for (i = 0; i < dtab->n_buckets; i++) {
+			struct bpf_dtab_acceldev *odev;
+			struct bpf_dtab_acceldev *ndev;
+			struct hlist_head *head;
+
+			head = dev_map_index_hash(dtab, i);
+			hlist_for_each_entry_rcu(odev, head, index_hlist) {
+				if (odev->acceldev_type == ops_new->acceldev_ops.acceldev_type &&
+				    odev->dev == ops_new->acceldev_ops.dev &&
+					!odev->acceldev_ops) {
+					/* Don't call __acceldev_map_alloc_node(),
+					 * because no need to init again.
+					 */
+					ndev = bpf_map_kmalloc_node(&dtab->map, sizeof(*ndev),
+								    GFP_NOWAIT | __GFP_NOWARN,
+									dtab->map.numa_node);
+					if (!ndev)
+						return -ENOMEM;
+				}
+
+				memcpy(ndev, odev, sizeof(*ndev));
+				for_each_possible_cpu(cpu) {
+					per_cpu_ptr(ndev->bq, cpu)->acceldev = ndev;
+				}
+
+				ndev->acceldev_ops = &ops_new->acceldev_ops;
+				hlist_del_rcu(&odev->index_hlist);
+				hlist_add_head_rcu(&ndev->index_hlist,
+						   dev_map_index_hash(dtab, ndev->idx));
+				call_rcu(&odev->rcu, __acceldev_entry_free_no_destory);
+			}
+		}
+		spin_unlock_irqrestore(&dtab->index_lock, flags);
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+EXPORT_SYMBOL(bpf_acceldevmap_register);
+
+/* exported to acceldev driver */
+int bpf_acceldevmap_unregister(struct bpf_acceldev_ops *acceldev_ops)
+{
+	struct bpf_acceldev_ops_data *ops_old;
+	struct bpf_dtab *dtab;
+	int i;
+	unsigned long flags;
+	int cpu;
+
+	/* Remove acceldev_ops from acceldev hlist */
+	rcu_read_lock();
+	list_for_each_entry_rcu(dtab, &dev_map_list, list) {
+		if (!DTAB_STYLE_IS_ACCELDEV(dtab) ||
+		    dtab->map.map_type != BPF_MAP_TYPE_DEVMAP_HASH)
+			continue;
+
+		spin_lock_irqsave(&dtab->index_lock, flags);
+		for (i = 0; i < dtab->n_buckets; i++) {
+			struct bpf_dtab_acceldev *odev;
+			struct bpf_dtab_acceldev *ndev;
+			struct hlist_head *head;
+			struct hlist_node *next;
+
+			head = dev_map_index_hash(dtab, i);
+
+			hlist_for_each_entry_safe(odev, next, head, index_hlist) {
+				if (odev->dev == acceldev_ops->dev &&
+				    odev->acceldev_ops)	{
+					/* Don't call __acceldev_map_alloc_node(),
+					 * because no need to init again.
+					 */
+					ndev = bpf_map_kmalloc_node(&dtab->map, sizeof(*ndev),
+								    GFP_NOWAIT | __GFP_NOWARN,
+									dtab->map.numa_node);
+					if (!ndev)
+						return -ENOMEM;
+
+					memcpy(ndev, odev, sizeof(*ndev));
+					for_each_possible_cpu(cpu) {
+						per_cpu_ptr(ndev->bq, cpu)->acceldev = ndev;
+					}
+
+					ndev->acceldev_ops = NULL;
+					hlist_del_rcu(&odev->index_hlist);
+					hlist_add_head_rcu(&ndev->index_hlist,
+							   dev_map_index_hash(dtab, ndev->idx));
+					call_rcu(&odev->rcu, __acceldev_entry_free_no_destory);
+				}
+			}
+		}
+		spin_unlock_irqrestore(&dtab->index_lock, flags);
+	}
+	rcu_read_unlock();
+
+	synchronize_rcu();
+
+	/* Remove acceldev_ops from acceldev_ops_list */
+	spin_lock(&acceldev_ops_data_lock);
+	list_for_each_entry(ops_old, &acceldev_ops_data_list, list) {
+		if (acceldev_ops->acceldev_type == ops_old->acceldev_ops.acceldev_type &&
+		    acceldev_ops->dev == ops_old->acceldev_ops.dev) {
+			list_del(&ops_old->list);
+			kfree(ops_old);
+			break;
+		}
+	}
+	spin_unlock(&acceldev_ops_data_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL(bpf_acceldevmap_unregister);
+
 static int dev_map_init_map(struct bpf_dtab *dtab, union bpf_attr *attr)
 {
 	u32 valsize = attr->value_size;
@@ -116,10 +437,11 @@ static int dev_map_init_map(struct bpf_dtab *dtab, union bpf_attr *attr)
 	 * 4 bytes: ifindex
 	 * 8 bytes: ifindex + prog fd
 	 */
-	if (attr->max_entries == 0 || attr->key_size != 4 ||
+	if (attr->max_entries == 0 || (attr->key_size != 4 && attr->key_size != 8) ||
 	    (valsize != offsetofend(struct bpf_devmap_val, ifindex) &&
-	     valsize != offsetofend(struct bpf_devmap_val, bpf_prog.fd)) ||
-	    attr->map_flags & ~DEV_CREATE_FLAG_MASK)
+		valsize != offsetofend(struct bpf_devmap_val, bpf_prog.fd) &&
+		attr->key_size != 8) ||
+		attr->map_flags & ~DEV_CREATE_FLAG_MASK)
 		return -EINVAL;
 
 	/* Lookup returns a pointer straight to dev->ifindex, so make sure the
@@ -127,8 +449,29 @@ static int dev_map_init_map(struct bpf_dtab *dtab, union bpf_attr *attr)
 	 */
 	attr->map_flags |= BPF_F_RDONLY_PROG;
 
+	/* Set dev_type */
+	if (attr->map_flags & BPF_F_ACCELDEVMAP_HASH)
+		dtab->dev_type = BPF_ACCEL_DEV;
+	else
+		dtab->dev_type = BPF_NET_DEV;
 
 	bpf_map_init_from_attr(&dtab->map, attr);
+
+	/* Set MIN & MAX entry size of acceldev */
+	if (dtab->dev_type == BPF_ACCEL_DEV) {
+		if (dtab->map.max_entries < ACCELDEV_NUM_MIN) {
+			/* trace_printk("max_entries :%d too small, set to min value : %d\n",
+			 * dtab->map.max_entries, ACCELDEV_NUM_MIN);
+			 */
+			dtab->map.max_entries = ACCELDEV_NUM_MIN;
+		}
+		if (dtab->map.max_entries > ACCELDEV_NUM_MAX) {
+			/* trace_printk("max_entries :%d too big, set to max value : %d\n",
+			 * dtab->map.max_entries, ACCELDEV_NUM_MAX);
+			 */
+			dtab->map.max_entries = ACCELDEV_NUM_MAX;
+		}
+	}
 
 	if (attr->map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
 		dtab->n_buckets = roundup_pow_of_two(dtab->map.max_entries);
@@ -180,10 +523,34 @@ static struct bpf_map *dev_map_alloc(union bpf_attr *attr)
 	return &dtab->map;
 }
 
+void acceldev_ctx_hash_free(struct hlist_head *n, unsigned int sz)
+{
+	if (sz <= PAGE_SIZE)
+		kfree(n);
+	else if (hashdist)
+		vfree(n);
+	else
+		free_pages((unsigned long)n, get_order(sz));
+}
+
+void acceldev_destroy_instance(struct bpf_dtab_acceldev *acceldev)
+{
+	if (acceldev->acceldev_ops &&
+	    acceldev->acceldev_ops->destroy_instance)
+		acceldev->acceldev_ops->destroy_instance(acceldev->acceldev_handle);
+}
+
+void acceldev_destroy_ctx(struct bpf_dtab_acceldev *acceldev, struct bpf_acceldevmap_val_ctx *ctx)
+{
+	if (acceldev->acceldev_ops &&
+	    acceldev->acceldev_ops->destroy_ctx)
+		acceldev->acceldev_ops->destroy_ctx(acceldev->acceldev_handle, ctx->ctx);
+}
+
 static void dev_map_free(struct bpf_map *map)
 {
 	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
-	int i;
+	int i, j;
 
 	/* At this point bpf_prog->aux->refcnt == 0 and this map->refcnt == 0,
 	 * so the programs (can be more than one that used this map) were
@@ -205,7 +572,44 @@ static void dev_map_free(struct bpf_map *map)
 	/* Make sure prior __dev_map_entry_free() have completed. */
 	rcu_barrier();
 
-	if (dtab->map.map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
+	if (dtab->map.map_type == BPF_MAP_TYPE_DEVMAP_HASH && DTAB_STYLE_IS_ACCELDEV(dtab)) {
+		for (i = 0; i < dtab->n_buckets; i++) {
+			struct bpf_dtab_acceldev *acceldev;
+			struct hlist_head *head, *chead;
+			struct hlist_node *next;
+
+			head = dev_map_index_hash(dtab, i);
+
+			hlist_for_each_entry_safe(acceldev, next, head, index_hlist) {
+				/* acceldev:Double Hash remove START */
+				unsigned int hmask = BUCKET_TO_HMASK(acceldev->ctx_n_buckets);
+				unsigned int sz = (hmask + 1) * sizeof(struct hlist_head);
+
+				for (j = 0; j <= hmask; j++) {
+					struct bpf_acceldevmap_val_ctx *ctx;
+					struct hlist_node *nctx;
+
+					chead = acceldev->ctx_idx_head + j;
+					hlist_for_each_entry_safe(ctx, nctx, chead, index_hlist) {
+						hlist_del_rcu(&ctx->index_hlist);
+						acceldev_destroy_ctx(acceldev, ctx);
+						acceldev->ctx_items--;
+						kfree(ctx);
+					}
+				}
+				WARN_ON(!hlist_empty(acceldev->ctx_idx_head));
+				acceldev_ctx_hash_free(acceldev->ctx_idx_head, sz);
+				/* acceldev:Double Hash remove END */
+
+				hlist_del_rcu(&acceldev->index_hlist);
+				acceldev_destroy_instance(acceldev);
+				if (acceldev->xdp_prog)
+					bpf_prog_put(acceldev->xdp_prog);
+				pci_dev_put(acceldev->dev);
+				kfree(acceldev);
+			}
+		}
+	} else if (dtab->map.map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
 		for (i = 0; i < dtab->n_buckets; i++) {
 			struct bpf_dtab_netdev *dev;
 			struct hlist_head *head;
@@ -221,7 +625,6 @@ static void dev_map_free(struct bpf_map *map)
 				kfree(dev);
 			}
 		}
-
 		bpf_map_area_free(dtab->dev_index_head);
 	} else {
 		for (i = 0; i < dtab->map.max_entries; i++) {
@@ -278,6 +681,34 @@ static void *__dev_map_hash_lookup_elem(struct bpf_map *map, u32 key)
 	return NULL;
 }
 
+static void *__acceldev_map_hash_lookup_elem(struct bpf_map *map, u32 key)
+{
+	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
+	struct hlist_head *head = dev_map_index_hash(dtab, key);
+	struct bpf_dtab_acceldev *acceldev;
+
+	hlist_for_each_entry_rcu(acceldev, head, index_hlist,
+				 lockdep_is_held(&dtab->index_lock)) {
+		if (acceldev->idx == key)
+			return acceldev;
+	}
+	return NULL;
+}
+
+static void *__acceldev_ctx_map_hash_lookup_elem(struct bpf_dtab_acceldev *acceldev, u32 key)
+{
+	struct bpf_acceldevmap_val_ctx *acceldev_ctx;
+	struct hlist_head *acceldev_ctx_head;
+
+	acceldev_ctx_head = acceldev_ctx_map_index_hash(acceldev, key);
+	hlist_for_each_entry_rcu(acceldev_ctx, acceldev_ctx_head, index_hlist) {
+		if (acceldev_ctx->idx == key)
+			return acceldev_ctx;
+	}
+
+	return NULL;
+}
+
 static int dev_map_hash_get_next_key(struct bpf_map *map, void *key,
 				    void *next_key)
 {
@@ -287,37 +718,145 @@ static int dev_map_hash_get_next_key(struct bpf_map *map, void *key,
 	struct hlist_head *head;
 	int i = 0;
 
+	/* For acceldev */
+	u64 *acceldev_next = next_key;
+	struct bpf_dtab_acceldev *adev, *nadev;
+	u32 key_instance;
+#if ACCELDEV_GET_NEXT_KEY_CTX_ENBALED
+	struct bpf_acceldevmap_val_ctx *ctx, *nctx;
+#endif
+
 	if (!key)
 		goto find_first;
 
-	idx = *(u32 *)key;
+	if (dtab->dev_type == BPF_NET_DEV) {
+		idx = *(u32 *)key;
 
-	dev = __dev_map_hash_lookup_elem(map, idx);
-	if (!dev)
+		dev = __dev_map_hash_lookup_elem(map, idx);
+		if (!dev)
+			goto find_first;
+
+		next_dev = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(&dev->index_hlist)),
+					    struct bpf_dtab_netdev, index_hlist);
+
+		if (next_dev) {
+			*next = next_dev->idx;
+			return 0;
+		}
+
+		i = idx & (dtab->n_buckets - 1);
+		i++;
+	} else if (!DTAB_STYLE_IS_ACCELDEV(dtab)) {
+		return -ENOENT;
+	}
+#if ACCELDEV_GET_NEXT_KEY_CTX_ENBALED
+	u32 key_ctx;
+
+	key_instance = GET_KEY_INSTANCE(key);
+	key_ctx = GET_KEY_CTX(key);
+
+	adev = __acceldev_map_hash_lookup_elem(map, key_instance);
+	if (!adev)
 		goto find_first;
 
-	next_dev = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(&dev->index_hlist)),
-				    struct bpf_dtab_netdev, index_hlist);
+	/* From ctx hash list - Start */
+	ctx = __acceldev_ctx_map_hash_lookup_elem(adev, key_ctx);
+	if (!ctx)
+		goto find_first;
 
-	if (next_dev) {
-		*next = next_dev->idx;
+	nctx = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(&ctx->index_hlist)),
+				struct bpf_acceldevmap_val_ctx, index_hlist);
+
+	if (nctx) {
+		*acceldev_next = (u64)nctx->idx;
+		*acceldev_next &= ((u64)adev->idx) << 32;
+		return 0;
+	}
+	/* From ctx hash list - End */
+
+	nadev = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(&adev->index_hlist)),
+				 struct bpf_dtab_acceldev, index_hlist);
+
+	if (nadev) {
+		nctx = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(nadev->ctx_idx_head)),
+					struct bpf_acceldevmap_val_ctx, index_hlist);
+
+		if (nctx) {
+			*acceldev_next = (u64)nctx->idx;
+			*acceldev_next &= ((u64)nadev->idx) << 32;
+			return 0;
+		}
+	}
+
+	i = idx & (dtab->n_buckets - 1);
+	i++;
+#else
+	key_instance = GET_KEY_INSTANCE(key);
+
+	adev = __acceldev_map_hash_lookup_elem(map, key_instance);
+	if (!adev)
+		goto find_first;
+
+	nadev = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(&adev->index_hlist)),
+				 struct bpf_dtab_acceldev, index_hlist);
+
+	if (nadev) {
+		*acceldev_next = nadev->idx;
 		return 0;
 	}
 
 	i = idx & (dtab->n_buckets - 1);
 	i++;
+#endif
 
- find_first:
-	for (; i < dtab->n_buckets; i++) {
-		head = dev_map_index_hash(dtab, i);
+find_first:
+	if (dtab->dev_type == BPF_NET_DEV) {
+		for (; i < dtab->n_buckets; i++) {
+			head = dev_map_index_hash(dtab, i);
 
-		next_dev = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(head)),
-					    struct bpf_dtab_netdev,
-					    index_hlist);
-		if (next_dev) {
-			*next = next_dev->idx;
-			return 0;
+			next_dev = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(head)),
+						    struct bpf_dtab_netdev,
+						    index_hlist);
+			if (next_dev) {
+				*next = next_dev->idx;
+				return 0;
+			}
 		}
+	} else if (DTAB_STYLE_IS_ACCELDEV(dtab)) {
+#if ACCELDEV_GET_NEXT_KEY_CTX_ENBALED
+		for (; i < dtab->n_buckets; i++) {
+			head = dev_map_index_hash(dtab, i);
+
+			nadev = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(head)),
+						 struct bpf_dtab_acceldev,
+						    index_hlist);
+
+			if (nadev) {
+				head = nadev->ctx_idx_head;
+				nctx = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(head)),
+							struct bpf_acceldevmap_val_ctx,
+							index_hlist);
+
+				if (nctx) {
+					*acceldev_next = (u64)nctx->idx;
+					*acceldev_next &= ((u64)nadev->idx) << 32;
+					return 0;
+				}
+			}
+		}
+#else
+		for (; i < dtab->n_buckets; i++) {
+			head = dev_map_index_hash(dtab, i);
+
+			nadev = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(head)),
+						 struct bpf_dtab_acceldev,
+							index_hlist);
+			if (nadev) {
+				*acceldev_next = nadev->idx;
+				return 0;
+			}
+		}
+#endif
 	}
 
 	return -ENOENT;
@@ -360,6 +899,34 @@ static int dev_map_bpf_prog_run(struct bpf_prog *xdp_prog,
 		}
 	}
 	return nframes; /* sent frames count */
+}
+
+static void acceldev_bq_xmit_all(struct xdp_acceldev_bulk_queue *acceldev_bq, u32 flags)
+{
+	struct bpf_dtab_acceldev *acceldev = acceldev_bq->acceldev;
+	unsigned int cnt = acceldev_bq->count;
+	u32 to_send = cnt;
+	int i;
+	struct xdp_frame *xdpf;
+
+	if (unlikely(!cnt))
+		return;
+
+	for (i = 0; i < cnt; i++) {
+		xdpf = acceldev_bq->q[i];
+		prefetch(xdpf);
+	}
+
+	acceldev->acceldev_ops->enqueue(acceldev_bq->acceldev->acceldev_handle,
+								   acceldev_bq->acceldev,
+								   acceldev_bq->q,
+								   to_send,
+								   acceldev_bq->xdp_prog,
+								   acceldev_bq->dev_rx);
+
+	/* Failure process will add here in the future */
+
+	acceldev_bq->count = 0;
 }
 
 static void bq_xmit_all(struct xdp_dev_bulk_queue *bq, u32 flags)
@@ -413,12 +980,21 @@ void __dev_flush(void)
 {
 	struct list_head *flush_list = this_cpu_ptr(&dev_flush_list);
 	struct xdp_dev_bulk_queue *bq, *tmp;
+	struct xdp_acceldev_bulk_queue *acceldev_bq, *acceldev_tmp;
 
 	list_for_each_entry_safe(bq, tmp, flush_list, flush_node) {
 		bq_xmit_all(bq, XDP_XMIT_FLUSH);
 		bq->dev_rx = NULL;
 		bq->xdp_prog = NULL;
 		__list_del_clearprev(&bq->flush_node);
+	}
+
+	flush_list = this_cpu_ptr(&acceldev_flush_list);
+	list_for_each_entry_safe(acceldev_bq, acceldev_tmp, flush_list, flush_node) {
+		acceldev_bq_xmit_all(acceldev_bq, XDP_XMIT_FLUSH);
+		acceldev_bq->dev_rx = NULL;
+		acceldev_bq->xdp_prog = NULL;
+		__list_del_clearprev(&acceldev_bq->flush_node);
 	}
 }
 
@@ -468,6 +1044,25 @@ static void bq_enqueue(struct net_device *dev, struct xdp_frame *xdpf,
 	bq->q[bq->count++] = xdpf;
 }
 
+static void acceldev_bq_enqueue(struct bpf_dtab_acceldev *acceldev, struct xdp_frame *xdpf,
+				struct net_device *dev_rx, struct bpf_prog *xdp_prog)
+{
+	struct list_head *flush_list = this_cpu_ptr(&acceldev_flush_list);
+	struct xdp_acceldev_bulk_queue *acceldev_bq;
+
+	acceldev_bq = this_cpu_ptr(acceldev->bq);
+	if (unlikely(acceldev_bq->count == DEV_MAP_BULK_SIZE_ACCELDEV))
+		acceldev_bq_xmit_all(acceldev_bq, 0);
+
+	if (!acceldev_bq->dev_rx) {
+		acceldev_bq->dev_rx = dev_rx;
+		acceldev_bq->xdp_prog = xdp_prog;
+		list_add(&acceldev_bq->flush_node, flush_list);
+	}
+
+	acceldev_bq->q[acceldev_bq->count++] = xdpf;
+}
+
 static inline int __xdp_enqueue(struct net_device *dev, struct xdp_frame *xdpf,
 				struct net_device *dev_rx,
 				struct bpf_prog *xdp_prog)
@@ -482,6 +1077,14 @@ static inline int __xdp_enqueue(struct net_device *dev, struct xdp_frame *xdpf,
 		return err;
 
 	bq_enqueue(dev, xdpf, dev_rx, xdp_prog);
+	return 0;
+}
+
+static inline int __acceldev_enqueue(struct bpf_dtab_acceldev *acceldev, struct xdp_frame *xdpf,
+				     struct net_device *dev_rx,
+					struct bpf_prog *xdp_prog)
+{
+	acceldev_bq_enqueue(acceldev, xdpf, dev_rx, xdp_prog);
 	return 0;
 }
 
@@ -528,6 +1131,31 @@ int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_frame *xdpf,
 	struct net_device *dev = dst->dev;
 
 	return __xdp_enqueue(dev, xdpf, dev_rx, dst->xdp_prog);
+}
+
+int acceldev_map_enqueue(struct bpf_dtab_acceldev *dst, struct xdp_frame *xdpf,
+			 struct net_device *dev_rx)
+{
+	struct bpf_acceldev_ops *ops;
+	void *handle;
+
+	if (!dst ||
+	    !dst->acceldev_ops ||
+		!dst->acceldev_ops->enqueue)
+		return -EFAULT;
+
+	if (batch_enabled) {
+		/* Batch request */
+		return __acceldev_enqueue(dst, xdpf, dev_rx, dst->xdp_prog);
+	} else {
+		/* Single request */
+		ops = dst->acceldev_ops;
+		handle = dst->acceldev_handle;
+		if (ops->enqueue(handle, dst, &xdpf, 1, dst->xdp_prog, dev_rx) == 1)
+			return 0;
+		else
+			return -EFAULT;
+	}
 }
 
 static bool is_valid_dst(struct bpf_dtab_netdev *obj, struct xdp_frame *xdpf)
@@ -783,10 +1411,73 @@ static void *dev_map_lookup_elem(struct bpf_map *map, void *key)
 
 static void *dev_map_hash_lookup_elem(struct bpf_map *map, void *key)
 {
-	struct bpf_dtab_netdev *obj = __dev_map_hash_lookup_elem(map,
+	if (is_acceldev(map)) {
+#if ACCELDEV_LOOKUP_ELEM_CTX_ENBALED
+		u32 key_instance = GET_KEY_INSTANCE(key);
+		u32 key_ctx = GET_KEY_CTX(key);
+		struct bpf_dtab_acceldev *acceldev;
+		struct bpf_acceldevmap_val_ctx *acceldev_ctx;
+
+		acceldev = __acceldev_map_hash_lookup_elem(map, key_instance);
+		if (!acceldev)
+			return NULL;
+
+		acceldev_ctx = __acceldev_ctx_map_hash_lookup_elem(acceldev, key_ctx);
+		return acceldev_ctx ? &acceldev_ctx->acceldevmap_val : NULL;
+#else
+		u32 key_instance = GET_KEY_INSTANCE(key);
+		struct bpf_dtab_acceldev *acceldev = __acceldev_map_hash_lookup_elem(map,
+								key_instance);
+		return acceldev ? &acceldev->acceldev_handle : NULL;
+#endif
+	} else {
+		struct bpf_dtab_netdev *obj = __dev_map_hash_lookup_elem(map,
 								*(u32 *)key);
-	return obj ? &obj->val : NULL;
+		return obj ? &obj->val : NULL;
+	}
 }
+
+void *dev_map_hash_lookup_acceldevmap_val(void *dev, u32 key_ctx)
+{
+	unsigned int sequence;
+	struct bpf_dtab_acceldev *acceldev = dev;
+	struct bpf_acceldevmap_val_ctx *acceldev_ctx;
+
+	do {
+		sequence = read_seqcount_begin(&acceldev->ctx_seqcount_lock);
+
+		rcu_read_lock();
+		acceldev_ctx = __acceldev_ctx_map_hash_lookup_elem(acceldev, key_ctx);
+		rcu_read_unlock();
+	} while ((read_seqcount_retry(&acceldev->ctx_seqcount_lock, sequence)) && (!acceldev_ctx));
+
+	if (!acceldev_ctx)
+		return NULL;
+
+	return &acceldev_ctx->acceldevmap_val;
+}
+EXPORT_SYMBOL(dev_map_hash_lookup_acceldevmap_val);
+
+void *dev_map_hash_lookup_acceldevmap_ctx(void *dev, u32 key_ctx)
+{
+	unsigned int sequence;
+	struct bpf_dtab_acceldev *acceldev = dev;
+	struct bpf_acceldevmap_val_ctx *acceldev_ctx;
+
+	do {
+		sequence = read_seqcount_begin(&acceldev->ctx_seqcount_lock);
+
+		rcu_read_lock();
+		acceldev_ctx = __acceldev_ctx_map_hash_lookup_elem(acceldev, key_ctx);
+		rcu_read_unlock();
+	} while ((read_seqcount_retry(&acceldev->ctx_seqcount_lock, sequence)) && (!acceldev_ctx));
+
+	if (NULL == acceldev_ctx)
+		return NULL;
+
+	return acceldev_ctx->ctx;
+}
+EXPORT_SYMBOL(dev_map_hash_lookup_acceldevmap_ctx);
 
 static void __dev_map_entry_free(struct rcu_head *rcu)
 {
@@ -797,6 +1488,45 @@ static void __dev_map_entry_free(struct rcu_head *rcu)
 		bpf_prog_put(dev->xdp_prog);
 	dev_put(dev->dev);
 	kfree(dev);
+}
+
+static void __acceldev_map_entry_free(struct rcu_head *rcu)
+{
+	struct bpf_dtab_acceldev *acceldev;
+
+	acceldev = container_of(rcu, struct bpf_dtab_acceldev, rcu);
+
+	acceldev_destroy_instance(acceldev);
+
+	if (acceldev->xdp_prog)
+		bpf_prog_put(acceldev->xdp_prog);
+	pci_dev_put(acceldev->dev);
+
+	free_percpu(acceldev->bq);
+	acceldev->bq = NULL;
+	kfree(acceldev);
+}
+
+static void __acceldev_map_ctx_entry_free(struct rcu_head *rcu)
+{
+	struct bpf_acceldevmap_val_ctx *ctx;
+
+	ctx = container_of(rcu, struct bpf_acceldevmap_val_ctx, rcu);
+
+	if (ctx->acceldev_ops &&
+	    ctx->acceldev_ops->destroy_ctx)
+		ctx->acceldev_ops->destroy_ctx(ctx->acceldev_handle, ctx->ctx);
+
+	kfree(ctx);
+}
+
+static void __acceldev_map_ctx_entry_free_without_destory(struct rcu_head *rcu)
+{
+	struct bpf_acceldevmap_val_ctx *acceldev_ctx;
+
+	acceldev_ctx = container_of(rcu, struct bpf_acceldevmap_val_ctx, rcu);
+
+	kfree(acceldev_ctx);
 }
 
 static int dev_map_delete_elem(struct bpf_map *map, void *key)
@@ -817,23 +1547,279 @@ static int dev_map_delete_elem(struct bpf_map *map, void *key)
 static int dev_map_hash_delete_elem(struct bpf_map *map, void *key)
 {
 	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
-	struct bpf_dtab_netdev *old_dev;
-	int k = *(u32 *)key;
 	unsigned long flags;
 	int ret = -ENOENT;
 
-	spin_lock_irqsave(&dtab->index_lock, flags);
+	if (DTAB_STYLE_IS_ACCELDEV(dtab)) {
+		struct bpf_dtab_acceldev *odev;
+		struct bpf_acceldevmap_val_ctx *octx;
+		u32 key_instance = GET_KEY_INSTANCE(key);
+		u32 key_ctx = GET_KEY_CTX(key);
 
-	old_dev = __dev_map_hash_lookup_elem(map, k);
-	if (old_dev) {
-		dtab->items--;
-		hlist_del_init_rcu(&old_dev->index_hlist);
-		call_rcu(&old_dev->rcu, __dev_map_entry_free);
-		ret = 0;
+		spin_lock_irqsave(&dtab->index_lock, flags);
+		odev = __acceldev_map_hash_lookup_elem(map, key_instance);
+		if (odev) {
+			octx = __acceldev_ctx_map_hash_lookup_elem(odev, key_ctx);
+			if (octx) {
+				spin_lock_bh(&odev->ctx_lock);
+
+				odev->ctx_items--;
+				hlist_del_rcu(&octx->index_hlist);
+
+				call_rcu(&octx->rcu, __acceldev_map_ctx_entry_free);
+				ret = 0;
+
+				/* Delete accledev if instance doesn't have any ctx anymore. */
+				if (odev->ctx_items == 0)
+					call_rcu(&odev->rcu, __acceldev_map_entry_free);
+
+				spin_unlock_bh(&odev->ctx_lock);
+			}
+		}
+		spin_unlock_irqrestore(&dtab->index_lock, flags);
+	} else {
+		struct bpf_dtab_netdev *old_dev;
+		int k = *(u32 *)key;
+
+		spin_lock_irqsave(&dtab->index_lock, flags);
+
+		old_dev = __dev_map_hash_lookup_elem(map, k);
+		if (old_dev) {
+			dtab->items--;
+			hlist_del_rcu(&old_dev->index_hlist);
+			call_rcu(&old_dev->rcu, __dev_map_entry_free);
+			ret = 0;
+		}
+		spin_unlock_irqrestore(&dtab->index_lock, flags);
 	}
-	spin_unlock_irqrestore(&dtab->index_lock, flags);
 
 	return ret;
+}
+
+struct hlist_head *acceldev_ctx_hash_alloc(unsigned int sz)
+{
+	struct hlist_head *n;
+
+	if (sz <= PAGE_SIZE)
+		n = kzalloc(sz, GFP_KERNEL);
+	else if (hashdist)
+		n = vzalloc(sz);
+	else
+		n = (struct hlist_head *)
+			__get_free_pages(GFP_KERNEL | __GFP_NOWARN | __GFP_ZERO,
+					 get_order(sz));
+
+	return n;
+}
+
+static unsigned long acceldev_ctx_hash_new_size(unsigned int state_hmask)
+{
+	return ((state_hmask + 1) << 1) * sizeof(struct hlist_head);
+}
+
+static void ctx_hash_transfer(struct hlist_head *list,
+			      struct hlist_head *ctx_list,
+			       unsigned int nhashmask)
+{
+	struct hlist_node *tmp;
+	struct bpf_acceldevmap_val_ctx *acceldev_ctx;
+
+	hlist_for_each_entry_safe(acceldev_ctx, tmp, list, index_hlist) {
+		unsigned int h;
+
+		h = acceldev_ctx_map_index_hash_with_mask(acceldev_ctx->idx, nhashmask);
+		hlist_add_head_rcu(&acceldev_ctx->index_hlist, ctx_list + h);
+	}
+}
+
+static void acceldev_ctx_hash_resize(struct work_struct *work)
+{
+	struct bpf_dtab_acceldev *dev;
+	struct hlist_head *ndst, *odst;
+	unsigned long nsize, osize;
+	unsigned int nhashmask, ohashmask;
+	int i;
+
+	dev = container_of(work, struct bpf_dtab_acceldev, ctx_hash_work);
+	nsize = acceldev_ctx_hash_new_size(BUCKET_TO_HMASK(dev->ctx_n_buckets));
+	ndst = acceldev_ctx_hash_alloc(nsize);
+	if (!ndst)
+		return;
+
+	spin_lock_bh(&dev->ctx_lock);
+	write_seqcount_begin(&dev->ctx_seqcount_lock);
+
+	nhashmask = (nsize / sizeof(struct hlist_head)) - 1U;
+	odst = rcu_dereference_protected(dev->ctx_idx_head, lockdep_is_held(&dev->ctx_lock));
+
+	for (i = BUCKET_TO_HMASK(dev->ctx_n_buckets); i >= 0; i--)
+		ctx_hash_transfer(odst + i, ndst, nhashmask);
+
+	ohashmask = BUCKET_TO_HMASK(dev->ctx_n_buckets);
+
+	rcu_assign_pointer(dev->ctx_idx_head, ndst);
+	dev->ctx_n_buckets = HMASK_TO_BUCKET(nhashmask);
+
+	write_seqcount_end(&dev->ctx_seqcount_lock);
+	spin_unlock_bh(&dev->ctx_lock);
+
+	osize = (ohashmask + 1) * sizeof(struct hlist_head);
+
+	synchronize_rcu();
+
+	acceldev_ctx_hash_free(odst, osize);
+}
+
+static struct bpf_dtab_acceldev *__acceldev_map_alloc_node(struct bpf_dtab *dtab,
+							   struct bpf_acceldevmap_val *val,
+						    unsigned int idx)
+{
+	struct bpf_prog *prog = NULL;
+	struct bpf_dtab_acceldev *acceldev;
+	struct bpf_acceldev_ops_data *ops;
+	int err;
+	int sz = sizeof(struct hlist_head) * ACCELDEV_CTX_BUCKET;
+	int cpu;
+	unsigned int devfn;
+
+	acceldev = bpf_map_kmalloc_node(&dtab->map, sizeof(*acceldev),
+					GFP_NOWAIT | __GFP_NOWARN,
+				   dtab->map.numa_node);
+	if (!acceldev)
+		return ERR_PTR(-ENOMEM);
+
+	acceldev->bq = alloc_percpu(struct xdp_acceldev_bulk_queue);
+	if (!acceldev->bq)
+		goto err_out;
+
+	for_each_possible_cpu(cpu) {
+		per_cpu_ptr(acceldev->bq, cpu)->acceldev = acceldev;
+	}
+
+	acceldev->ctx_idx_head = acceldev_ctx_hash_alloc(sz);
+	if (!acceldev->ctx_idx_head)
+		goto err_out;
+
+	/* Get pci_dev by bdf */
+	devfn = PCI_DEVFN(PCI_SLOT(val->bdfn), PCI_FUNC(val->bdfn));
+	acceldev->dev = pci_get_domain_bus_and_slot(0, ((val->bdfn >> 8) & 0xFF), devfn);
+	if (!acceldev->dev) {
+		err = -EINVAL;
+		goto err_out;
+	}
+
+	if (val->bpf_prog.fd > 0) {
+		prog = bpf_prog_get_type_dev(val->bpf_prog.fd,
+					     BPF_PROG_TYPE_XDP, false);
+		if (IS_ERR(prog)) {
+			err = -EINVAL;
+			goto err_put_dev;
+		}
+	}
+
+	acceldev->idx = idx;
+	acceldev->dtab = dtab;
+	acceldev->acceldev_type = val->acceldev_type;
+
+	/* acceldev_ctx hash init */
+	acceldev->ctx_n_buckets = sz / sizeof(struct hlist_head);
+	acceldev->ctx_items = 0;
+	INIT_WORK(&acceldev->ctx_hash_work, acceldev_ctx_hash_resize);
+	spin_lock_init(&acceldev->ctx_lock);
+	seqcount_spinlock_init(&acceldev->ctx_seqcount_lock, &acceldev->ctx_lock);
+
+	/* check acceldev_ops_data_list and set pci_dev */
+	acceldev->acceldev_ops = NULL;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(ops, &acceldev_ops_data_list, list) {
+		if (ops->acceldev_ops.acceldev_type == acceldev->acceldev_type &&
+		    ops->acceldev_ops.dev == acceldev->dev) {
+			acceldev->acceldev_ops = &ops->acceldev_ops;
+		}
+	}
+	rcu_read_unlock();
+	acceldev->acceldev_handle = NULL;
+
+	/* bpf_acceldevmap_val set in acceldev_ctx */
+	if (prog)
+		acceldev->xdp_prog = prog;
+	else
+		acceldev->xdp_prog = NULL;
+
+	return acceldev;
+
+err_put_dev:
+	pci_dev_put(acceldev->dev);
+
+err_out:
+	kfree(acceldev);
+	return ERR_PTR(err);
+}
+
+static void acceldev_ctx_hash_grow_check(struct bpf_dtab_acceldev *acceldev, bool have_collision)
+{
+	if (have_collision &&
+	    (BUCKET_TO_HMASK(acceldev->ctx_n_buckets) + 1) < ACCELDEV_CTX_HASHMAX &&
+		acceldev->ctx_items > BUCKET_TO_HMASK(acceldev->ctx_n_buckets)) {
+		schedule_work(&acceldev->ctx_hash_work);
+	}
+}
+
+static struct bpf_acceldevmap_val_ctx *__acceldev_ctx_alloc(struct bpf_dtab_acceldev *dev,
+							    struct bpf_acceldevmap_val *val,
+	unsigned int idx)
+{
+	struct bpf_acceldevmap_val_ctx *ctx;
+	unsigned int sz;
+	struct bpf_acceldev_ops *ops;
+
+	if (!dev)
+		return ERR_PTR(-EINVAL);
+
+	sz = sizeof(*ctx) + val->acceldata_sz;
+	ctx = bpf_map_kmalloc_node(&dev->dtab->map, sz,
+				   GFP_NOWAIT | __GFP_NOWARN,
+				   dev->dtab->map.numa_node);
+	if (!ctx)
+		return ERR_PTR(-ENOMEM);
+
+	ctx->idx = idx;
+	ops = dev->acceldev_ops;
+
+	if (ops)
+		ctx->acceldev_ops = ops;
+
+	sz = sizeof(struct bpf_acceldevmap_val) + val->acceldata_sz;
+	memcpy((void *)(&ctx->acceldevmap_val), val, sz);
+
+	if (dev->xdp_prog)
+		ctx->acceldevmap_val.bpf_prog.id = dev->xdp_prog->aux->id;
+	else
+		ctx->acceldevmap_val.bpf_prog.id = 0;
+
+	if (!dev->acceldev_handle) {
+		if (ops &&
+		    ops->create_instance) {
+			dev->acceldev_handle = ops->create_instance(&ctx->acceldevmap_val);
+			if (IS_ERR(dev->acceldev_handle))
+				return ERR_PTR(-EINVAL);
+		} else {
+		}
+	} else {
+	}
+
+	if (ops &&
+	    ops->create_ctx) {
+		ctx->ctx = ops->create_ctx(dev->acceldev_handle, &ctx->acceldevmap_val);
+		if (IS_ERR(ctx->ctx)) {
+			kfree(ctx);
+			return ERR_PTR(-EINVAL);
+		}
+		ctx->acceldev_handle = dev->acceldev_handle;
+	}
+
+	return ctx;
 }
 
 static struct bpf_dtab_netdev *__dev_map_alloc_node(struct net *net,
@@ -932,8 +1918,192 @@ static int dev_map_update_elem(struct bpf_map *map, void *key, void *value,
 				     map, key, value, map_flags);
 }
 
-static int __dev_map_hash_update_elem(struct net *net, struct bpf_map *map,
-				     void *key, void *value, u64 map_flags)
+static int __acceldev_map_hash_update_elem(struct bpf_map *map,
+					   void *key, void *value, u64 map_flags)
+{
+	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
+	struct bpf_dtab_acceldev *ndev = NULL;
+	struct bpf_dtab_acceldev *odev = NULL;
+	struct bpf_acceldevmap_val_ctx *nctx = NULL;
+	struct bpf_acceldevmap_val_ctx *octx = NULL;
+	struct bpf_acceldevmap_val *acceldev_val = NULL;
+	u32 key_instance = GET_KEY_INSTANCE(key);
+	u32 key_ctx = GET_KEY_CTX(key);
+	unsigned long flags;
+	int err = -EEXIST;
+	struct bpf_prog *prog = NULL;
+	int cpu;
+	bool collision = false;
+
+	acceldev_val = (struct bpf_acceldevmap_val *)value;
+
+	/* already verified value_size <= sizeof val */
+	if (unlikely(map_flags > BPF_EXIST || !acceldev_val || acceldev_val->bdfn == 0))
+		return -EINVAL;
+
+	spin_lock_irqsave(&dtab->index_lock, flags);
+
+	odev = __acceldev_map_hash_lookup_elem(map, key_instance);
+	if (odev && (map_flags & BPF_NOEXIST))
+		goto out_err;
+
+	/* Instance found */
+	if (odev) {
+		octx = __acceldev_ctx_map_hash_lookup_elem(odev, key_ctx);
+		if (octx && (map_flags & BPF_NOEXIST))
+			goto out_err_ctx_locked;
+
+		/* Ctx found */
+		if (octx) {
+			spin_lock_bh(&odev->ctx_lock);
+
+			/* Create new ctx */
+			nctx = __acceldev_ctx_alloc(odev, acceldev_val, key_ctx);
+			if (IS_ERR(nctx)) {
+				err = PTR_ERR(nctx);
+				spin_unlock_bh(&odev->ctx_lock);
+				goto out_err_ctx_locked;
+			}
+
+			/* Delete old ctx from hlist */
+			hlist_del_rcu(&octx->index_hlist);
+
+			/* Add new ctx into hlist */
+			hlist_add_head_rcu(&nctx->index_hlist,
+					   acceldev_ctx_map_index_hash(odev, key_ctx));
+
+			/* Free old ctx */
+			call_rcu(&octx->rcu, __acceldev_map_ctx_entry_free);
+
+			spin_unlock_bh(&odev->ctx_lock);
+		} else {
+			/* Ctx not found */
+			spin_lock_bh(&odev->ctx_lock);
+
+			/* Create new ctx */
+			nctx = __acceldev_ctx_alloc(odev, acceldev_val, key_ctx);
+			if (IS_ERR(nctx)) {
+				err = PTR_ERR(nctx);
+				spin_unlock_bh(&odev->ctx_lock);
+				goto out_err_ctx_locked;
+			}
+
+			/* Add new ctx into hlist */
+			hlist_add_head_rcu(&nctx->index_hlist,
+					   acceldev_ctx_map_index_hash(odev, key_ctx));
+
+			/* Ctx item++ */
+			odev->ctx_items++;
+			spin_unlock_bh(&odev->ctx_lock);
+			if (nctx->index_hlist.next)
+				collision = true;
+			acceldev_ctx_hash_grow_check(odev, collision);
+		}
+
+		/* Create new instance */
+		/* Don't call __acceldev_map_alloc_node() because no need to init again. */
+		ndev = bpf_map_kmalloc_node(&dtab->map, sizeof(*ndev), GFP_NOWAIT | __GFP_NOWARN,
+					    dtab->map.numa_node);
+		if (!ndev)
+			return -ENOMEM;
+
+		/* Update new instance here(xdp_prog) */
+		memcpy(ndev, odev, sizeof(*ndev));
+
+		for_each_possible_cpu(cpu) {
+			per_cpu_ptr(ndev->bq, cpu)->acceldev = ndev;
+		}
+
+		if (acceldev_val->bpf_prog.fd > 0) {
+			prog = bpf_prog_get_type_dev(acceldev_val->bpf_prog.fd,
+						     BPF_PROG_TYPE_XDP, false);
+		}
+
+		if (prog)
+			ndev->xdp_prog = prog;
+		else
+			ndev->xdp_prog = NULL;
+
+		/* Delete old instance from hlist */
+		hlist_del_rcu(&odev->index_hlist);
+
+		/* Add new instance into hlist */
+		hlist_add_head_rcu(&ndev->index_hlist,
+				   dev_map_index_hash(dtab, key_instance));
+
+		if (odev->xdp_prog)
+			bpf_prog_put(odev->xdp_prog);
+
+		call_rcu(&odev->rcu, __acceldev_entry_free_no_destory);
+		spin_unlock_irqrestore(&dtab->index_lock, flags);
+	} else {
+		/* Instance not found */
+		/* Create new instance */
+		if (dtab->items >= dtab->map.max_entries) {
+			err = -E2BIG;
+			goto out_err;
+		}
+
+		ndev = __acceldev_map_alloc_node(dtab, acceldev_val, key_instance);
+		if (IS_ERR(ndev)) {
+			err = PTR_ERR(ndev);
+			goto out_err;
+		}
+
+		/* Add new instance into hlist */
+		hlist_add_head_rcu(&ndev->index_hlist,
+				   dev_map_index_hash(dtab, key_instance));
+
+		/* Instance item++ */
+		dtab->items++;
+		spin_unlock_irqrestore(&dtab->index_lock, flags);
+
+		/* Create new ctx */
+		nctx = __acceldev_ctx_alloc(ndev, acceldev_val, key_ctx);
+		if (IS_ERR(nctx)) {
+			err = PTR_ERR(nctx);
+			spin_unlock_bh(&ndev->ctx_lock);
+			goto out_err_ctx_locked;
+		}
+
+		/* Add new ctx into hlist */
+		spin_lock_bh(&ndev->ctx_lock);
+		hlist_add_head_rcu(&nctx->index_hlist,
+				   acceldev_ctx_map_index_hash(ndev, key_ctx));
+
+		/* Ctx item++ */
+		ndev->ctx_items++;
+		spin_unlock_bh(&ndev->ctx_lock);
+
+		if (nctx->index_hlist.next)
+			collision = true;
+		acceldev_ctx_hash_grow_check(odev, collision);
+	}
+
+	return 0;
+
+out_err_ctx_locked:
+
+out_err:
+	spin_unlock_irqrestore(&dtab->index_lock, flags);
+
+	if (nctx && !IS_ERR(nctx) && octx)
+		call_rcu(&nctx->rcu, __acceldev_map_ctx_entry_free_without_destory);
+
+	if (nctx && !IS_ERR(nctx) && !octx)
+		call_rcu(&nctx->rcu, __acceldev_map_ctx_entry_free);
+
+	if (ndev && !IS_ERR(ndev) && odev)
+		call_rcu(&ndev->rcu, __acceldev_entry_free_no_destory);
+
+	if (ndev && !IS_ERR(ndev) && !odev)
+		call_rcu(&ndev->rcu, __acceldev_map_entry_free);
+
+	return err;
+}
+
+static long __dev_map_hash_update_elem(struct net *net, struct bpf_map *map,
+				       void *key, void *value, u64 map_flags)
 {
 	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
 	struct bpf_dtab_netdev *dev, *old_dev;
@@ -988,6 +2158,9 @@ out_err:
 static int dev_map_hash_update_elem(struct bpf_map *map, void *key, void *value,
 				   u64 map_flags)
 {
+	if (is_acceldev(map))
+		return __acceldev_map_hash_update_elem(map, key, value, map_flags);
+
 	return __dev_map_hash_update_elem(current->nsproxy->net_ns,
 					 map, key, value, map_flags);
 }
@@ -1001,6 +2174,12 @@ static int dev_map_redirect(struct bpf_map *map, u64 ifindex, u64 flags)
 
 static int dev_hash_map_redirect(struct bpf_map *map, u64 ifindex, u64 flags)
 {
+	if (is_acceldev(map)) {
+		return __bpf_xdp_redirect_map(map, ifindex, flags,
+				      BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS,
+				      __acceldev_map_hash_lookup_elem);
+	}
+
 	return __bpf_xdp_redirect_map(map, ifindex, flags,
 				      BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS,
 				      __dev_map_hash_lookup_elem);
@@ -1125,8 +2304,10 @@ static int __init dev_map_init(void)
 		     offsetof(struct _bpf_dtab_netdev, dev));
 	register_netdevice_notifier(&dev_map_notifier);
 
-	for_each_possible_cpu(cpu)
+	for_each_possible_cpu(cpu) {
 		INIT_LIST_HEAD(&per_cpu(dev_flush_list, cpu));
+		INIT_LIST_HEAD(&per_cpu(acceldev_flush_list, cpu));
+	}
 	return 0;
 }
 

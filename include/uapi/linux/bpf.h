@@ -1261,6 +1261,12 @@ enum {
 
 /* Create a map that is suitable to be an inner map with dynamic max entries */
 	BPF_F_INNER_MAP		= (1U << 12),
+
+/* Create a map that will be registered/unregesitered by the backed bpf_link */
+	BPF_F_LINK		= (1U << 13),
+
+/* Indicate accel dev for devmap_hash */
+	BPF_F_ACCELDEVMAP_HASH	= (1U << 14),
 };
 
 /* Flags for BPF_PROG_QUERY. */
@@ -6128,6 +6134,21 @@ struct xdp_md {
 	__u32 egress_ifindex;  /* txq->dev->ifindex */
 };
 
+/* bpf dev type for devmap hash */
+enum bpf_dev_type {
+	BPF_NET_DEV = 0,
+	BPF_ACCEL_DEV = 1,
+	BPF_MAX_DEV = 2
+};
+
+/* bpf accel dev type */
+enum bpf_acceldev_type {
+	BPF_ACCELDEV_CRYPTO = 0,
+	BPF_ACCELDEV_COMPRESS = 1,
+	BPF_ACCELDEV_MEDIA = 2,
+	BPF_ACCELDEV_MAX = 3
+};
+
 /* DEVMAP map-value layout
  *
  * The struct data-layout of map-value is a configuration interface.
@@ -6140,6 +6161,66 @@ struct bpf_devmap_val {
 		__u32 id;  /* prog id on map read */
 	} bpf_prog;
 };
+
+/* ACCELDEVMAP map-value layout
+ *
+ * The struct data-layout of map-value is a configuration interface.
+ * New members can only be added to the end of this structure.
+ */
+struct bpf_acceldevmap_val {
+	enum bpf_acceldev_type acceldev_type;
+	__u32 bdfn;
+
+	union {
+		int   fd;       /* prog fd on map write */
+		__u32 id;       /* prog id on map read */
+	} bpf_prog;
+
+	/* accel data is opaque to acceldevmap. It is defined and
+	 * used by custom bpf program and acceldev ops. It can consist
+	 * of acceldev private data
+	 */
+	__u32 acceldata_sz;
+	__u8 acceldata[0];
+};
+
+#define MAX_ACCEL_NAME 16
+struct bpf_acceldev_ops {
+	char acceldev_name[MAX_ACCEL_NAME];
+	enum bpf_acceldev_type acceldev_type;
+	struct pci_dev *dev;
+
+	/* create/destroy acceldev instance */
+	void * (*create_instance)(struct bpf_acceldevmap_val *val);
+	int (*destroy_instance)(void *acceldev_handle);
+
+	/* Please clean it up post kfunc defined!
+	 * look up the same acceldev instance as the one selected by
+	 * user (map key) for the same flow.
+	 * map key generated thru acceldev driver functions for both control
+	 * path and data path with the same rule.
+	 */
+	/* int (*lookup_instance)(void *xdp_frame); */
+
+	/* create/destroy context for acceldevmap_val */
+	void * (*create_ctx)(void *acceldev_handle,
+			     struct bpf_acceldevmap_val *val);
+	int (*destroy_ctx)(void *acceldev_handle, void *ctx);
+
+	/* enqueue data into acceldev instance.
+	 * include lookup ctx/bpf_acceldevmap_val with xdp_frame.
+	 * arguments are struct hlist_head, xdp_frame, bpf_prog, net_device */
+	int (*enqueue)(void *acceldev_handle, void *dev, void *xdp_frame, __u32 xdp_frame_size, void *bpf_prog, void *dev_rx);
+};
+
+#ifdef __KERNEL__
+/* exported to acceldev driver */
+int bpf_acceldevmap_register(struct bpf_acceldev_ops *acceldev_ops);
+int bpf_acceldevmap_unregister(struct bpf_acceldev_ops *acceldev_ops);
+void *dev_map_hash_lookup_acceldevmap_val(void *dev, u32 key_ctx);
+void *dev_map_hash_lookup_acceldevmap_ctx(void *dev, u32 key_ctx);
+void bpf_acceldevmap_set_single_mode(bool status);
+#endif
 
 /* CPUMAP map-value layout
  *

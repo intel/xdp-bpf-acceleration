@@ -54,6 +54,7 @@ tprogs-y += hbm
 tprogs-y += xdp_redirect_cpu
 tprogs-y += xdp_redirect_map_multi
 tprogs-y += xdp_redirect_map
+tprogs-y += xdp_redirect_map_acceldev
 tprogs-y += xdp_redirect
 tprogs-y += xdp_monitor
 
@@ -115,6 +116,7 @@ hbm-objs := hbm.o $(CGROUP_HELPERS)
 xdp_redirect_map_multi-objs := xdp_redirect_map_multi_user.o $(XDP_SAMPLE)
 xdp_redirect_cpu-objs := xdp_redirect_cpu_user.o $(XDP_SAMPLE)
 xdp_redirect_map-objs := xdp_redirect_map_user.o $(XDP_SAMPLE)
+xdp_redirect_map_acceldev-objs := xdp_redirect_map_acceldev_user.o $(XDP_SAMPLE)
 xdp_redirect-objs := xdp_redirect_user.o $(XDP_SAMPLE)
 xdp_monitor-objs := xdp_monitor_user.o $(XDP_SAMPLE)
 xdp_router_ipv4-objs := xdp_router_ipv4_user.o $(XDP_SAMPLE)
@@ -200,6 +202,7 @@ TPROGS_CFLAGS += -I$(LIBBPF_INCLUDE)
 TPROGS_CFLAGS += -I$(srctree)/tools/include
 TPROGS_CFLAGS += -I$(srctree)/tools/perf
 TPROGS_CFLAGS += -DHAVE_ATTR_TEST=0
+TPROGS_CFLAGS += -I$(QAT_XDP_INCLUDE)/drivers/crypto/qat/qat_xdp/
 
 ifdef SYSROOT
 TPROGS_CFLAGS += --sysroot=$(SYSROOT)
@@ -211,6 +214,7 @@ TPROGLDLIBS_xdp_monitor		+= -lm
 TPROGLDLIBS_xdp_redirect	+= -lm
 TPROGLDLIBS_xdp_redirect_cpu	+= -lm
 TPROGLDLIBS_xdp_redirect_map	+= -lm
+TPROGLDLIBS_xdp_redirect_map_acceldev	+= -lm
 TPROGLDLIBS_xdp_redirect_map_multi += -lm
 TPROGLDLIBS_xdp_router_ipv4	+= -lm -pthread
 TPROGLDLIBS_tracex4		+= -lrt
@@ -343,6 +347,7 @@ $(obj)/hbm_edt_kern.o: $(src)/hbm.h $(src)/hbm_kern.h
 XDP_SAMPLE_CFLAGS += -Wall -O2 \
 		     -I$(src)/../../tools/include \
 		     -I$(src)/../../tools/include/uapi \
+		     -I$(QAT_XDP_INCLUDE)/drivers/crypto/qat/qat_xdp/ \
 		     -I$(LIBBPF_INCLUDE) \
 		     -I$(src)/../../tools/testing/selftests/bpf
 
@@ -395,6 +400,7 @@ $(obj)/%.bpf.o: $(src)/%.bpf.c $(obj)/vmlinux.h $(src)/xdp_sample.bpf.h $(src)/x
 	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(SRCARCH) \
 		-Wno-compare-distinct-pointer-types -I$(srctree)/include \
 		-I$(srctree)/samples/bpf -I$(srctree)/tools/include \
+		-I$(QAT_XDP_INCLUDE)/drivers/crypto/qat/qat_xdp/ \
 		-I$(LIBBPF_INCLUDE) $(CLANG_SYS_INCLUDES) \
 		-c $(filter %.bpf.c,$^) -o $@
 

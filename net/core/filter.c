@@ -4243,7 +4243,11 @@ static __always_inline int __xdp_do_redirect_frame(struct bpf_redirect_info *ri,
 		fallthrough;
 	case BPF_MAP_TYPE_DEVMAP_HASH:
 		map = READ_ONCE(ri->map);
-		if (unlikely(map)) {
+		if (is_acceldev(map)) {
+			WRITE_ONCE(ri->map, NULL);
+			ri->flags = 0;
+			err = acceldev_map_enqueue(fwd, xdpf, dev);
+		} else if (unlikely(map)) {
 			WRITE_ONCE(ri->map, NULL);
 			err = dev_map_enqueue_multi(xdpf, dev, map,
 						    ri->flags & BPF_F_EXCLUDE_INGRESS);
@@ -4295,6 +4299,11 @@ int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp,
 
 	if (map_type == BPF_MAP_TYPE_XSKMAP)
 		return __xdp_do_redirect_xsk(ri, dev, xdp, xdp_prog);
+
+	/* acceldev and xsk chaining */
+	if ((xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL) &&
+	    is_acceldev(READ_ONCE(ri->map)))
+		xdp_buff_set_xsk_with_accel(xdp);
 
 	return __xdp_do_redirect_frame(ri, dev, xdp_convert_buff_to_frame(xdp),
 				       xdp_prog);
