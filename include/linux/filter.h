@@ -990,6 +990,13 @@ int xdp_do_redirect_frame(struct net_device *dev,
 			  struct bpf_prog *prog);
 void xdp_do_flush(void);
 
+#define DEV_MAP_FLUSH 0
+#define CPU_MAP_FLUSH 1
+#define XSK_MAP_FLUSH 2
+
+void xdp_do_flush_by_type(int type);
+
+
 /* The xdp_do_flush_map() helper has been renamed to drop the _map suffix, as
  * it is no longer only flushing maps. Keep this define for compatibility
  * until all drivers are updated - do not use xdp_do_flush_map() in new code!

@@ -962,4 +962,9 @@ static inline void ice_clear_rdma_cap(struct ice_pf *pf)
 
 	clear_bit(ICE_FLAG_RDMA_ENA, pf->flags);
 }
+
+#define QAT_AF_XDP_DISABLED 0
+#define QAT_AF_XDP_ENABLED 1
+extern int qat_af_xdp_enabled;
+
 #endif /* _ICE_H_ */

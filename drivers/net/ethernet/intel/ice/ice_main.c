@@ -36,6 +36,10 @@ MODULE_DESCRIPTION(DRV_SUMMARY);
 MODULE_LICENSE("GPL v2");
 MODULE_FIRMWARE(ICE_DDP_PKG_FILE);
 
+int qat_af_xdp_enabled = QAT_AF_XDP_ENABLED;
+module_param(qat_af_xdp_enabled, int, 0644);
+MODULE_PARM_DESC(qat_af_xdp_enabled, "Select to enable qat af xdp! 0: disabled, 1: enabled. Default: 0");
+
 static int debug = -1;
 module_param(debug, int, 0644);
 #ifndef CONFIG_DYNAMIC_DEBUG

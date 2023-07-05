@@ -7,6 +7,10 @@
 #define __LINUX_NET_XDP_H__
 
 #include <linux/skbuff.h> /* skb_shared_info */
+/* #include <net/xdp_sock_drv.h> */
+/* #include <net/xsk_buff_pool.h> */
+#include <linux/types.h>
+#include <linux/dma-mapping.h>
 
 /**
  * DOC: XDP RX-queue information
@@ -84,6 +88,15 @@ struct xdp_buff {
 	struct xdp_txq_info *txq;
 	u32 frame_sz; /* frame size to deduce data_hard_end/reserved tailroom*/
 	u32 flags; /* supported values defined in xdp_buff_flags */
+};
+
+struct xdp_buff_xsk {
+        struct xdp_buff xdp;
+        dma_addr_t dma;
+        dma_addr_t frame_dma;
+        struct xsk_buff_pool *pool;
+        u64 orig_addr;
+        struct list_head free_list_node;
 };
 
 static __always_inline bool xdp_buff_has_frags(struct xdp_buff *xdp)
@@ -184,6 +197,8 @@ struct xdp_frame {
 	struct net_device *dev_rx; /* used by cpumap */
 	u32 frame_sz;
 	u32 flags; /* supported values defined in xdp_buff_flags */
+	dma_addr_t dma;
+	struct xdp_buff *xdp;
 };
 
 static __always_inline bool xdp_frame_has_frags(struct xdp_frame *frame)
@@ -273,6 +288,7 @@ int xdp_update_frame_from_buff(struct xdp_buff *xdp,
 			       struct xdp_frame *xdp_frame)
 {
 	int metasize, headroom;
+	struct xdp_buff_xsk *xskb = container_of(xdp, struct xdp_buff_xsk, xdp);
 
 	/* Assure headroom is available for storing info */
 	headroom = xdp->data - xdp->data_hard_start;
@@ -293,6 +309,8 @@ int xdp_update_frame_from_buff(struct xdp_buff *xdp,
 	xdp_frame->metasize = metasize;
 	xdp_frame->frame_sz = xdp->frame_sz;
 	xdp_frame->flags = xdp->flags;
+	xdp_frame->dma = xskb->dma;
+	xdp_frame->xdp = xdp;
 
 	return 0;
 }

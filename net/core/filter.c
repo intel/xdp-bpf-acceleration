@@ -4145,7 +4145,31 @@ static const struct bpf_func_proto bpf_xdp_adjust_meta_proto = {
  * called from NAPI without a separate rcu_read_lock(). The code below does not
  * use RCU annotations, but relies on those in the map code.
  */
-void xdp_do_flush(void)
+
+void xdp_do_flush_by_type(int type)
+{
+	switch (type) {
+	case DEV_MAP_FLUSH:
+		printk("xdp_do_flush_by_type:  __dev_flush\n");
+
+		__dev_flush();
+		break;
+	case CPU_MAP_FLUSH:
+		__cpu_map_flush();
+		break;
+	case XSK_MAP_FLUSH:
+		printk("xdp_do_flush_by_type:  __xsk_map_flush\n");
+
+		__xsk_map_flush();
+		break;
+	default:
+		break;
+	}
+}
+EXPORT_SYMBOL_GPL(xdp_do_flush_by_type);
+
+
+void xdp_do_flush()
 {
 	__dev_flush();
 	__cpu_map_flush();

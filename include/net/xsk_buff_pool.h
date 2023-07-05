@@ -19,6 +19,7 @@ struct xdp_sock;
 struct device;
 struct page;
 
+#if 0
 struct xdp_buff_xsk {
 	struct xdp_buff xdp;
 	dma_addr_t dma;
@@ -27,6 +28,7 @@ struct xdp_buff_xsk {
 	u64 orig_addr;
 	struct list_head free_list_node;
 };
+#endif
 
 struct xsk_dma_map {
 	dma_addr_t *dma_pages;
@@ -63,7 +65,7 @@ struct xsk_buff_pool {
 	struct xdp_desc *tx_descs;
 	u64 chunk_mask;
 	u64 addrs_cnt;
-	u32 free_list_cnt;
+	atomic_t free_list_cnt;
 	u32 dma_pages_cnt;
 	u32 free_heads_cnt;
 	u32 headroom;
@@ -80,6 +82,7 @@ struct xsk_buff_pool {
 	 * sockets share a single cq when the same netdev and queue id is shared.
 	 */
 	spinlock_t cq_lock;
+	spinlock_t free_list_lock;
 	struct xdp_buff_xsk *free_heads[];
 };
 

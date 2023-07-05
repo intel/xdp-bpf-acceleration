@@ -239,7 +239,9 @@ int main(int argc, char **argv)
 	}
 	PRINT_ACCELDEV_LOG_DEBUG("find xdp_acceldev_preprocess success\n");
 
-	postprocess = bpf_object__find_program_by_name(obj, "xdp_acceldev_postprocess");
+	/* postprocess = bpf_object__find_program_by_name(obj, "xdp_acceldev_postprocess"); */
+	postprocess = bpf_object__find_program_by_name(obj, "xdp_sock_for_acceldev_prog");
+
 	bpf_program__set_type(postprocess, BPF_PROG_TYPE_XDP);
 	if (!postprocess) {
 		PRINT_ACCELDEV_LOG("ERROR: finding prog xdp_acceldev_postprocess failed\n");

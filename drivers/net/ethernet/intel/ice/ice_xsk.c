@@ -613,6 +613,11 @@ ice_run_xdp_zc(struct ice_rx_ring *rx_ring, struct xdp_buff *xdp,
 	int err, result = ICE_XDP_PASS;
 	u32 act;
 
+	if (!xdp_prog) {
+		printk("ice_run_xdp_zc: NULL xdp_prog!\n");
+		return 0;
+	}
+
 	act = bpf_prog_run_xdp(xdp_prog, xdp);
 
 	if (likely(act == XDP_REDIRECT)) {

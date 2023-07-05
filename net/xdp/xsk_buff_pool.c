@@ -89,6 +89,8 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	INIT_LIST_HEAD(&pool->xsk_tx_list);
 	spin_lock_init(&pool->xsk_tx_list_lock);
 	spin_lock_init(&pool->cq_lock);
+	spin_lock_init(&pool->free_list_lock);
+
 	refcount_set(&pool->users, 1);
 
 	pool->fq = xs->fq_tmp;
@@ -513,16 +515,21 @@ static struct xdp_buff_xsk *__xp_alloc(struct xsk_buff_pool *pool)
 struct xdp_buff *xp_alloc(struct xsk_buff_pool *pool)
 {
 	struct xdp_buff_xsk *xskb;
+	unsigned long flags;
 
-	if (!pool->free_list_cnt) {
+
+	if (!atomic_read(&pool->free_list_cnt)) {
 		xskb = __xp_alloc(pool);
 		if (!xskb)
 			return NULL;
 	} else {
-		pool->free_list_cnt--;
+		atomic_dec(&pool->free_list_cnt);
+		spin_lock_irqsave(&pool->free_list_lock, flags);
 		xskb = list_first_entry(&pool->free_list, struct xdp_buff_xsk,
 					free_list_node);
 		list_del_init(&xskb->free_list_node);
+		spin_unlock_irqrestore(&pool->free_list_lock, flags);
+
 	}
 
 	xskb->xdp.data = xskb->xdp.data_hard_start + XDP_PACKET_HEADROOM;
@@ -584,18 +591,23 @@ static u32 xp_alloc_reused(struct xsk_buff_pool *pool, struct xdp_buff **xdp, u3
 {
 	struct xdp_buff_xsk *xskb;
 	u32 i;
+	unsigned long flags;
 
-	nb_entries = min_t(u32, nb_entries, pool->free_list_cnt);
+	nb_entries = min_t(u32, nb_entries, atomic_read(&pool->free_list_cnt));
 
 	i = nb_entries;
 	while (i--) {
+
+		spin_lock_irqsave(&pool->free_list_lock, flags);
 		xskb = list_first_entry(&pool->free_list, struct xdp_buff_xsk, free_list_node);
 		list_del_init(&xskb->free_list_node);
+		spin_unlock_irqrestore(&pool->free_list_lock, flags);
 
 		*xdp = &xskb->xdp;
 		xdp++;
 	}
-	pool->free_list_cnt -= nb_entries;
+	//pool->free_list_cnt -= nb_entries;
+	atomic_sub(nb_entries, &pool->free_list_cnt);
 
 	return nb_entries;
 }
@@ -614,7 +626,7 @@ u32 xp_alloc_batch(struct xsk_buff_pool *pool, struct xdp_buff **xdp, u32 max)
 		return !!buff;
 	}
 
-	if (unlikely(pool->free_list_cnt)) {
+	if (unlikely(atomic_read(&pool->free_list_cnt))) {
 		nb_entries1 = xp_alloc_reused(pool, xdp, max);
 		if (nb_entries1 == max)
 			return nb_entries1;
@@ -633,19 +645,23 @@ EXPORT_SYMBOL(xp_alloc_batch);
 
 bool xp_can_alloc(struct xsk_buff_pool *pool, u32 count)
 {
-	if (pool->free_list_cnt >= count)
+	if (atomic_read(&pool->free_list_cnt) >= count)
 		return true;
-	return xskq_cons_has_entries(pool->fq, count - pool->free_list_cnt);
+	return xskq_cons_has_entries(pool->fq, count - atomic_read(&pool->free_list_cnt));
 }
 EXPORT_SYMBOL(xp_can_alloc);
 
 void xp_free(struct xdp_buff_xsk *xskb)
 {
+	unsigned long flags;
+
 	if (!list_empty(&xskb->free_list_node))
 		return;
 
-	xskb->pool->free_list_cnt++;
+	atomic_inc(&xskb->pool->free_list_cnt);
+	spin_lock_irqsave(&xskb->pool->free_list_lock, flags);
 	list_add(&xskb->free_list_node, &xskb->pool->free_list);
+	spin_unlock_irqrestore(&xskb->pool->free_list_lock, flags);
 }
 EXPORT_SYMBOL(xp_free);
 

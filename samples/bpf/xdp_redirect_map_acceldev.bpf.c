@@ -10,6 +10,21 @@
 #define PRINT_ACCELDEV_LOG(...)
 /* #define PRINT_ACCELDEV_LOG(...) bpf_printk(__VA_ARGS__); */
 
+struct {
+        __uint(type, BPF_MAP_TYPE_XSKMAP);
+        __uint(max_entries, 4);
+        __uint(key_size, sizeof(int));
+        __uint(value_size, sizeof(int));
+} xsks_map_chained_acceldev SEC(".maps");
+
+SEC("xdp_sock") int xdp_sock_for_acceldev_prog(struct xdp_md *ctx)
+{
+	PRINT_ACCELDEV_LOG("=====================%s start xdp_sock_for_acceldev_prog", __func__);
+
+	/* Hard coded queue 0 for test */
+	return bpf_redirect_map(&xsks_map_chained_acceldev, 0, 0);
+}
+
 extern u32 bpf_xdp_inst_index(struct xdp_md *xdp_md) __ksym;
 
 struct {
