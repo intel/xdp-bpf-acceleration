@@ -77,7 +77,8 @@ int main(int argc, char **argv)
 {
 	/* struct bpf_link *link = NULL; */
 	struct bpf_program *preprocess, *postprocess;
-	int map_fd, post_action_fd;
+	int map_fd = -1;
+	int post_action_fd;
 	struct bpf_object *obj = NULL;
 	struct qat_xdp_acceldata *acceldata;
 	struct bpf_acceldevmap_val *acceldata_list[ACCELDATA_LIST_SIZE_MAX] = {0};
@@ -97,6 +98,9 @@ int main(int argc, char **argv)
 	bool remove_elem = false;
 	int size;
 
+	for (i = 0; i < ACCELDATA_LIST_SIZE_MAX; i++)
+		acceldata_list[i] = NULL;
+
 	/* Default parameter */
 	char *filename = "xdp_redirect_map_acceldev.bpf.o";
 	char *ifin = "ens802f1np1";
@@ -105,9 +109,9 @@ int main(int argc, char **argv)
 	__u32 spi = 0xcf18f8f8;
 	int ip_version = 4; /*ipv4*/
 	__u32 ipv4_dst = 0xc0a86e02; /* 192.168.110.2 */
-	char *pcipher_key = "ea750622fa18dc3b3aa96bd7654dbda9";
+	char *pcipher_key;
 	int cipher_alg = 4;	/* CPA_CY_SYM_CIPHER_AES_CBC */
-	char *pauth_key = "7b3c717f1270c0cc6249b5a4ed6f413de27c7a12";
+	char *pauth_key;
 	int auth_alg = 2;	/* CPA_CY_SYM_HASH_SHA1 */
 	int icv_length = 12;
 
@@ -249,18 +253,51 @@ int main(int argc, char **argv)
 	}
 	PRINT_ACCELDEV_LOG_DEBUG("find xdp_acceldev_postprocess success\n");
 
-	if (bpf_object__load(obj)) {
-		PRINT_ACCELDEV_LOG("ERROR: loading BPF object file failed\n");
-		goto cleanup;
-	}
-	PRINT_ACCELDEV_LOG_DEBUG("bpf_object__load success\n");
+//	map_fd = bpf_map_get_fd_by_id(39);
+	//map_fd = bpf_object__find_map_fd_by_name(obj, "acceldev_redirect_map");
 
-	map_fd = bpf_object__find_map_fd_by_name(obj, "acceldev_redirect_map");
+////////////////////////////////////////
+	int map_fd_tmp;
+	int err;
+        __u32 map_id_tmp = 0;
+        struct bpf_map_info map_info;
+        __u32 map_len = sizeof(struct bpf_map_info);
+
+        while (0 <= bpf_map_get_next_id(map_id_tmp, &map_id_tmp)) {
+                map_fd_tmp = bpf_map_get_fd_by_id(map_id_tmp);
+                err = bpf_obj_get_info_by_fd(map_fd_tmp, &map_info, &map_len);
+                if (err) {
+			PRINT_ACCELDEV_LOG("ERROR: failed bpf_obj_get_info_by_fd !\n");
+                        break;
+                }
+                if (!strncmp(map_info.name, "acceldev_redire", sizeof(map_info.name))) {
+			PRINT_ACCELDEV_LOG("map acceldev_redire is found!\n");
+			map_fd = map_fd_tmp;
+                        break;
+                }
+        }
+///////////////////////////
+
+
 	if (map_fd < 0) {
-		PRINT_ACCELDEV_LOG("ERROR: finding map acceldev_redirect_map in obj file failed\n");
-		goto cleanup;
+		PRINT_ACCELDEV_LOG("map acceldev_redire is NOT found!  Try to load in cass of non-remove command!\n");
+
+		if (!remove_elem) {
+			if (bpf_object__load(obj)) {
+				PRINT_ACCELDEV_LOG("ERROR: loading BPF object file failed\n");
+				goto cleanup;
+			}
+			PRINT_ACCELDEV_LOG_DEBUG("bpf_object__load success\n");
+
+			map_fd = bpf_object__find_map_fd_by_name(obj, "acceldev_redirect_map");
+			if (map_fd < 0) {
+				PRINT_ACCELDEV_LOG("ERROR: failed to get map_fd via bpf_object__find_map_fd_by_name\n");
+				goto cleanup;
+			}
+		}
 	}
-	PRINT_ACCELDEV_LOG_DEBUG("bpf_object__find_map_fd_by_name success map_fd = %d\n", map_fd);
+
+	PRINT_ACCELDEV_LOG(">>>>>>>>>>>>>>>>>> map_fd = %d\n", map_fd);
 
 	if (show_elem) {
 		i = 0;
@@ -292,7 +329,9 @@ int main(int argc, char **argv)
 	if (remove_elem) {
 		PRINT_ACCELDEV_LOG("Remove element: map_fd = 0x%x, key = %016llx\n", map_fd, key);
 		ret = bpf_map_lookup_elem(map_fd, &key, &value);
-		if (ret > 0) {
+		PRINT_ACCELDEV_LOG("Remove element: bpf_map_lookup_elem ret %u\n", ret);
+
+		if (ret == 0) {
 			ret = bpf_map_delete_elem(map_fd, &key);
 			if (ret < 0)
 				PRINT_ACCELDEV_LOG("Error : Remove element ret = %d\n", ret);
@@ -301,7 +340,7 @@ int main(int argc, char **argv)
 		} else {
 			PRINT_ACCELDEV_LOG("Element not found\n\n");
 		}
-		goto cleanup;
+		goto out;
 	}
 
 	ifindex_in = if_nametoindex(ifin);
@@ -377,6 +416,9 @@ int main(int argc, char **argv)
 		acceldata_list[i]->bpf_prog.fd = post_action_fd;
 		acceldata_list[i]->acceldata_sz = sizeof(struct qat_xdp_acceldata);
 
+		acceldata_list[i]->cpu = 4;  /* cpu on which only QAT enqueue & ISR running */
+		acceldata_list[i]->qsize = 2048; /*align to xdp_redirect_cpu_user.c, setting default queue to 2048 as worst-case (small packet) */
+
 		/* Get bdfn (key_instance + key_ctx) */
 		bdfn = (i % bdfn_num) + 1;
 		PRINT_ACCELDEV_LOG("Get bdfn from bdfn No.%d\n", bdfn);
@@ -403,8 +445,8 @@ int main(int argc, char **argv)
 		ret = bpf_map_update_elem(map_fd, &key, acceldata_list[i], BPF_ANY);
 		if (ret < 0)
 			PRINT_ACCELDEV_LOG("Error : bpf_map_update_elem failed, ret = %d\n", ret);
-
-		PRINT_ACCELDEV_LOG("bpf_map_update_elem success, ret = %d\n", ret);
+		else
+			PRINT_ACCELDEV_LOG("bpf_map_update_elem success on map_fd %u, ret = %d\n", map_fd, ret);
 	}
 	PRINT_ACCELDEV_LOG("=======================================\n");
 	PRINT_ACCELDEV_LOG("Acceldata in acceldata_list are all set\n\n");
@@ -418,6 +460,7 @@ cleanup:
 		}
 	}
 
+out:
 	/* bpf_link__destroy(link); */
 	bpf_object__close(obj);
 	PRINT_ACCELDEV_LOG("User program exit\n");

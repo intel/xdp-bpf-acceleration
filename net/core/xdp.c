@@ -439,7 +439,10 @@ void xdp_return_frame_rx_napi(struct xdp_frame *xdpf)
 		__xdp_return(page_address(page), &xdpf->mem, true, NULL);
 	}
 out:
-	__xdp_return(xdpf->data, &xdpf->mem, true, NULL);
+	if (xdpf->mem.type == MEM_TYPE_XSK_BUFF_POOL)
+		__xdp_return(xdpf->data, &xdpf->mem, true, xdpf->xdp);
+	else
+		__xdp_return(xdpf->data, &xdpf->mem, true, NULL);
 }
 EXPORT_SYMBOL_GPL(xdp_return_frame_rx_napi);
 

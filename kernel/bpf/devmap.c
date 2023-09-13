@@ -106,6 +106,15 @@ struct xdp_acceldev_bulk_queue {
 	unsigned int count;
 };
 
+
+#define CPU_MAP_BULK_SIZE 8  /* 8 == one cacheline on 64-bit archs */
+struct xdp_bulk_queue {
+	void *q[CPU_MAP_BULK_SIZE];
+	struct list_head flush_node;
+	struct bpf_dtab_acceldev *obj;
+	unsigned int count;
+};
+
 struct bpf_dtab_netdev {
 	struct net_device *dev; /* must be first member, due to tracepoint */
 	struct hlist_node index_hlist;
@@ -143,6 +152,7 @@ struct bpf_dtab_acceldev {
 	struct hlist_node index_hlist;
 	struct bpf_dtab *dtab;
 	struct bpf_prog *xdp_prog;
+	struct net_device *dev_rx;
 	struct rcu_head rcu;
 
 	/* acceldev instance, created only once when it's first selected by user
@@ -164,6 +174,22 @@ struct bpf_dtab_acceldev {
 	spinlock_t			ctx_lock; /* Used for ctx operation in acceldev */
 
 	struct xdp_acceldev_bulk_queue __percpu *bq;
+
+	/* For acceldev enqueue and IRQ processing on the specified cpu */
+	u32 cpu;    /* kthread CPU and map index */
+	/* int map_id; */ /* Back reference to map */
+
+	struct xdp_bulk_queue __percpu *bulkq;
+
+	/* the queue associated with current acceldev instance.
+	 * one instance correpsonding to only one queue
+	 */
+	struct ptr_ring *queue;
+
+	/* single-consumer kthread */
+	struct task_struct *kthread;
+	atomic_t refcnt; /* Control when this struct can be free'ed */
+	struct work_struct kthread_stop_wq;
 };
 
 struct bpf_dtab {
@@ -181,12 +207,73 @@ struct bpf_dtab {
 
 static DEFINE_PER_CPU(struct list_head, dev_flush_list);
 static DEFINE_PER_CPU(struct list_head, acceldev_flush_list);
+static DEFINE_PER_CPU(struct list_head, acceldev_flush_list_on_rcpu);
+
 
 static DEFINE_SPINLOCK(dev_map_lock);
 static LIST_HEAD(dev_map_list);
 static DEFINE_SPINLOCK(acceldev_ops_data_lock);
 static LIST_HEAD(acceldev_ops_data_list); /* bpf_acceldevmap_register() */
 static bool batch_enabled = true;
+
+static void bq_flush_to_queue(struct xdp_bulk_queue *bq)
+{
+	struct bpf_dtab_acceldev *rcpu = bq->obj;
+	unsigned int processed = 0, drops = 0;
+	struct ptr_ring *q;
+	int i;
+
+	if (unlikely(!bq->count))
+		return;
+
+	q = rcpu->queue;
+	spin_lock(&q->producer_lock);
+
+	for (i = 0; i < bq->count; i++) {
+		struct xdp_frame *xdpf = bq->q[i];
+		int err;
+
+		err = __ptr_ring_produce(q, xdpf);
+		if (err) {
+			drops++;
+			xdp_return_frame_rx_napi(xdpf);
+		}
+		processed++;
+	}
+	bq->count = 0;
+	spin_unlock(&q->producer_lock);
+
+	__list_del_clearprev(&bq->flush_node);
+}
+
+/* Runs under RCU-read-side, plus in softirq under NAPI protection.
+ * Thus, safe percpu variable access.
+ */
+static int acceldev_bulkq_enqueue(struct bpf_dtab_acceldev *rcpu, struct xdp_frame *xdpf)
+{
+	struct list_head *flush_list = this_cpu_ptr(&acceldev_flush_list_on_rcpu);
+	struct xdp_bulk_queue *bq = this_cpu_ptr(rcpu->bulkq);
+
+	if (unlikely(bq->count == CPU_MAP_BULK_SIZE))
+		bq_flush_to_queue(bq);
+
+	/* Notice, xdp_buff/page MUST be queued here, long enough for
+	 * driver to code invoking us to finished, due to driver
+	 * (e.g. ixgbe) recycle tricks based on page-refcnt.
+	 *
+	 * Thus, incoming xdp_frame is always queued here (else we race
+	 * with another CPU on page-refcnt and remaining driver code).
+	 * Queue time is very short, as driver will invoke flush
+	 * operation, when completing napi->poll call.
+	 */
+	bq->q[bq->count++] = xdpf;
+
+	if (!bq->flush_node.prev)
+		list_add(&bq->flush_node, flush_list);
+
+	return 0;
+}
+
 
 bool is_acceldev(struct bpf_map *map)
 {
@@ -253,6 +340,94 @@ void bpf_acceldevmap_set_single_mode(bool status)
 		batch_enabled = true;
 }
 EXPORT_SYMBOL(bpf_acceldevmap_set_single_mode);
+
+static int weight = 64;
+static int cr_enabled = 0;
+void bpf_acceldevmap_cfg_kthread(int _weight, int _cr_enabled)
+{
+	weight = _weight;
+	cr_enabled = _cr_enabled;
+	printk("weight is %u, cr_enabled is %u\n",
+			weight, cr_enabled);
+}
+EXPORT_SYMBOL(bpf_acceldevmap_cfg_kthread);
+
+static int acceldev_map_kthread_run(void *data)
+{
+	struct bpf_dtab_acceldev *rcpu = data;
+	struct xdp_acceldev_bulk_queue *acceldev_bq = this_cpu_ptr(rcpu->bq);
+
+	set_current_state(TASK_INTERRUPTIBLE);
+
+	/* When kthread gives stop order, then rcpu have been disconnected
+	 * from map, thus no new packets can enter. Remaining in-flight
+	 * per CPU stored packets are flushed to this queue.  Wait honoring
+	 * kthread_stop signal until queue is empty.
+	 */
+	while (!kthread_should_stop() || !__ptr_ring_empty(rcpu->queue)) {
+		unsigned int sched = 0;
+		int i, n;
+		void *frames[DEV_MAP_BULK_SIZE_ACCELDEV];
+		int frame_count = 0;
+
+		/* Release CPU reschedule checks */
+		if (__ptr_ring_empty(rcpu->queue)) {
+			set_current_state(TASK_INTERRUPTIBLE);
+			/* Recheck to avoid lost wake-up */
+			if (__ptr_ring_empty(rcpu->queue)) {
+				schedule();
+				sched = 1;
+			} else {
+				__set_current_state(TASK_RUNNING);
+			}
+		} else {
+			if(cr_enabled)
+				sched = cond_resched();
+		}
+
+		/*
+		 * single consumer, with this
+		 * kthread CPU pinned. Lockless access to ptr_ring
+		 * consume side valid as no-resize allowed of queue.
+		 */
+
+		do {
+		n = __ptr_ring_consume_batched(rcpu->queue, frames,
+					       DEV_MAP_BULK_SIZE_ACCELDEV);
+		for (i = 0; i < n; i++) {
+			struct page *page;
+			struct xdp_frame *xdpf = frames[i];
+
+			page = virt_to_page(xdpf);
+
+			/* Bring struct page memory area to curr CPU */
+			prefetchw(page);
+			acceldev_bq->q[i] = xdpf;
+			acceldev_bq->count++;
+			frame_count++;
+		}
+
+		if (acceldev_bq->count > 0) {
+#if 0
+			local_bh_disable();
+#endif
+			rcpu->acceldev_ops->enqueue(rcpu->acceldev_handle,
+						    rcpu,
+						    acceldev_bq->q,
+						    acceldev_bq->count,
+						    rcpu->xdp_prog,
+						    rcpu->dev_rx);
+#if 0
+			local_bh_enable(); /* resched point, may call do_softirq() */
+#endif
+			acceldev_bq->count = 0;
+		}
+		} while ((frame_count < weight) && (n != 0));
+	}
+	__set_current_state(TASK_RUNNING);
+
+	return 0;
+}
 
 /* exported to acceldev driver */
 int bpf_acceldevmap_register(struct bpf_acceldev_ops *acceldev_ops)
@@ -981,6 +1156,7 @@ void __dev_flush(void)
 	struct list_head *flush_list = this_cpu_ptr(&dev_flush_list);
 	struct xdp_dev_bulk_queue *bq, *tmp;
 	struct xdp_acceldev_bulk_queue *acceldev_bq, *acceldev_tmp;
+	struct xdp_bulk_queue *bulkq, *acceldev_on_rcpu_tmp;
 
 	list_for_each_entry_safe(bq, tmp, flush_list, flush_node) {
 		bq_xmit_all(bq, XDP_XMIT_FLUSH);
@@ -996,6 +1172,15 @@ void __dev_flush(void)
 		acceldev_bq->xdp_prog = NULL;
 		__list_del_clearprev(&acceldev_bq->flush_node);
 	}
+
+
+	flush_list = this_cpu_ptr(&acceldev_flush_list_on_rcpu);
+	list_for_each_entry_safe(bulkq, acceldev_on_rcpu_tmp, flush_list, flush_node) {
+		bq_flush_to_queue(bulkq);
+		/* If already running, costs spin_lock_irqsave + smb_mb */
+		wake_up_process(bulkq->obj->kthread);
+	}
+
 }
 
 /* Elements are kept alive by RCU; either by rcu_read_lock() (from syscall) or
@@ -1146,7 +1331,12 @@ int acceldev_map_enqueue(struct bpf_dtab_acceldev *dst, struct xdp_frame *xdpf,
 
 	if (batch_enabled) {
 		/* Batch request */
-		return __acceldev_enqueue(dst, xdpf, dev_rx, dst->xdp_prog);
+		if (atomic_read(&dst->refcnt) == 0) {
+			return __acceldev_enqueue(dst, xdpf, dev_rx, dst->xdp_prog);
+		} else {
+			dst->dev_rx = dev_rx;
+			return acceldev_bulkq_enqueue(dst, xdpf); /* kthread on remote cpu */
+		}
 	} else {
 		/* Single request */
 		ops = dst->acceldev_ops;
@@ -1426,8 +1616,10 @@ static void *dev_map_hash_lookup_elem(struct bpf_map *map, void *key)
 		return acceldev_ctx ? &acceldev_ctx->acceldevmap_val : NULL;
 #else
 		u32 key_instance = GET_KEY_INSTANCE(key);
+
 		struct bpf_dtab_acceldev *acceldev = __acceldev_map_hash_lookup_elem(map,
 								key_instance);
+
 		return acceldev ? &acceldev->acceldev_handle : NULL;
 #endif
 	} else {
@@ -1504,6 +1696,16 @@ static void __acceldev_map_entry_free(struct rcu_head *rcu)
 
 	free_percpu(acceldev->bq);
 	acceldev->bq = NULL;
+
+	/* For simplicity, The queue must be empty at this point for test!! */
+	if (atomic_dec_and_test(&acceldev->refcnt)) { // do it only in case of refcnt 1
+		ptr_ring_cleanup(acceldev->queue, NULL);
+		kfree(acceldev->queue);
+		acceldev->queue = NULL;
+		free_percpu(acceldev->bulkq);
+		acceldev->bulkq = NULL;
+		kthread_stop(acceldev->kthread);
+	}
 	kfree(acceldev);
 }
 
@@ -1572,6 +1774,15 @@ static int dev_map_hash_delete_elem(struct bpf_map *map, void *key)
 				/* Delete accledev if instance doesn't have any ctx anymore. */
 				if (odev->ctx_items == 0)
 					call_rcu(&odev->rcu, __acceldev_map_entry_free);
+
+
+				/* Due to caller map_hash_delete_elem() disable
+				 * preemption, cannot call kthread_stop() to make sure queue is empty.
+				 * Instead a work_queue is started for stopping kthread,
+				 * acceldev_map_kthread_stop, which waits for an RCU grace period before
+				 * stopping kthread, emptying the queue.
+				 * Not implemented yet!!!
+				 */
 
 				spin_unlock_bh(&odev->ctx_lock);
 			}
@@ -1694,6 +1905,7 @@ static struct bpf_dtab_acceldev *__acceldev_map_alloc_node(struct bpf_dtab *dtab
 
 	for_each_possible_cpu(cpu) {
 		per_cpu_ptr(acceldev->bq, cpu)->acceldev = acceldev;
+		per_cpu_ptr(acceldev->bq, cpu)->count = 0;
 	}
 
 	acceldev->ctx_idx_head = acceldev_ctx_hash_alloc(sz);
@@ -1730,6 +1942,8 @@ static struct bpf_dtab_acceldev *__acceldev_map_alloc_node(struct bpf_dtab *dtab
 
 	/* check acceldev_ops_data_list and set pci_dev */
 	acceldev->acceldev_ops = NULL;
+
+	atomic_set(&acceldev->refcnt, 0);
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(ops, &acceldev_ops_data_list, list) {
@@ -1932,8 +2146,10 @@ static int __acceldev_map_hash_update_elem(struct bpf_map *map,
 	unsigned long flags;
 	int err = -EEXIST;
 	struct bpf_prog *prog = NULL;
-	int cpu;
+	int cpu, i;
 	bool collision = false;
+	int numa;
+	gfp_t gfp = GFP_KERNEL | __GFP_NOWARN;
 
 	acceldev_val = (struct bpf_acceldevmap_val *)value;
 
@@ -2054,6 +2270,7 @@ static int __acceldev_map_hash_update_elem(struct bpf_map *map,
 		hlist_add_head_rcu(&ndev->index_hlist,
 				   dev_map_index_hash(dtab, key_instance));
 
+
 		/* Instance item++ */
 		dtab->items++;
 		spin_unlock_irqrestore(&dtab->index_lock, flags);
@@ -2078,9 +2295,58 @@ static int __acceldev_map_hash_update_elem(struct bpf_map *map,
 		if (nctx->index_hlist.next)
 			collision = true;
 		acceldev_ctx_hash_grow_check(odev, collision);
+
+		/* duplicate protection */
+		if (atomic_read(&ndev->refcnt) > 0 ||
+		    acceldev_val->cpu == 0) /* NIC IRQ on CPU 0 by default*/
+			return 0;
+
+		/* Alloc percpu bulkq */
+		ndev->bulkq = bpf_map_alloc_percpu(map, sizeof(*ndev->bulkq),
+					   sizeof(void *), gfp);
+		if (!ndev->bulkq)
+			goto out_err;
+
+		for_each_possible_cpu(i) {
+			per_cpu_ptr(ndev->bulkq, i)->obj = ndev;
+			per_cpu_ptr(ndev->bulkq, i)->count = 0;
+		}
+
+		/* Have map->numa_node, but choose node of redirect target CPU */
+		numa = cpu_to_node(acceldev_val->cpu);
+
+		/* Alloc queue */
+		ndev->queue = bpf_map_kmalloc_node(map, sizeof(*ndev->queue), gfp, numa);
+		if (!ndev->queue)
+			goto free_bulkq;
+
+		err = ptr_ring_init(ndev->queue, acceldev_val->qsize, gfp);
+		if (err)
+			goto free_queue;
+
+		ndev->cpu = acceldev_val->cpu;
+		//ndev->map_id = map->id;
+
+		/* Setup kthread */
+		ndev->kthread = kthread_create_on_node(acceldev_map_kthread_run, ndev, numa,
+						       "acceldevmap/on/cpu%d", ndev->cpu);
+		if (IS_ERR(ndev->kthread))
+			goto free_queue;
+
+		atomic_inc(&ndev->refcnt); /* 1-refcnt for kthread */
+
+		/* Make sure kthread runs on a single CPU */
+		kthread_bind(ndev->kthread, ndev->cpu);
+		wake_up_process(ndev->kthread);
 	}
 
 	return 0;
+
+free_queue:
+	kfree(ndev->queue);
+
+free_bulkq:
+	free_percpu(ndev->bulkq);
 
 out_err_ctx_locked:
 
@@ -2307,6 +2573,7 @@ static int __init dev_map_init(void)
 	for_each_possible_cpu(cpu) {
 		INIT_LIST_HEAD(&per_cpu(dev_flush_list, cpu));
 		INIT_LIST_HEAD(&per_cpu(acceldev_flush_list, cpu));
+		INIT_LIST_HEAD(&per_cpu(acceldev_flush_list_on_rcpu, cpu));
 	}
 	return 0;
 }

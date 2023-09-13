@@ -658,6 +658,9 @@ void xp_free(struct xdp_buff_xsk *xskb)
 	if (!list_empty(&xskb->free_list_node))
 		return;
 
+	if (!xskb->pool)
+		return;
+
 	atomic_inc(&xskb->pool->free_list_cnt);
 	spin_lock_irqsave(&xskb->pool->free_list_lock, flags);
 	list_add(&xskb->free_list_node, &xskb->pool->free_list);

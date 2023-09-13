@@ -6170,6 +6170,8 @@ struct bpf_devmap_val {
 struct bpf_acceldevmap_val {
 	enum bpf_acceldev_type acceldev_type;
 	__u32 bdfn;
+	__u32 cpu;
+	__u32 qsize;
 
 	union {
 		int   fd;       /* prog fd on map write */
