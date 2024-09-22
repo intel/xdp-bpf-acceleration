@@ -1,3 +1,34 @@
+Introduction
+============
+
+An inline crypto approach in eXpress Data Path (XDP) with a hardware-based
+accelerator, QuickAssist Technology (QAT), by introducing a new eBPF
+accelerator device map framework. The ingress encrypted packets from
+network interface controller (NIC) driver would be redirected to QAT
+accelerator device for decryption. Afterwards the flexible packet
+processing continues based on the plaintext.
+
+Applicable to different encrypted packets with protocols like IPSec,
+WireGuard, dTLS, QUIC, etc.
+
+The framework opens the opportunities to various accelerators which can
+manipulate the network packet, collaborating with eBPF program in kernel.
+It can facilitate different kinds of hardware-based accelerators (e.g.,
+FPGA, ASIC, GPU, etc.) to boost its capability of processing network
+packet in XDP layer.
+
+
+Details & Citation
+==================
+If you've found xdp acceleration may be useful for your use case, you may
+check more details and cite our paper as follow:
+
+https://ieeexplore.ieee.org/document/10491611
+
+"An In-Kernel Inline Crypto Solution for eXpress Data Path With QuickAssist
+Technology: Design, Prototyping and Performance Evaluation"
+
+
 Linux kernel
 ============
 
